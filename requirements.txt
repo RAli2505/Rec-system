@@ -1,0 +1,55 @@
+# MARS — Multi-Agent Recommender System
+# Python >= 3.11 required
+
+# Core scientific
+numpy>=1.24,<2.0
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+
+# Deep Learning
+torch>=2.0
+torch-geometric>=2.4
+
+# Gradient Boosting
+xgboost>=2.0
+lightgbm>=4.0
+
+# Collaborative Filtering
+implicit>=0.7
+
+# IRT
+py-irt>=0.4
+
+# NLP / Embeddings
+sentence-transformers>=2.2
+faiss-cpu>=1.7                  # or faiss-gpu
+
+# Graph
+networkx>=3.1
+
+# Imbalanced Learning
+imbalanced-learn>=0.11
+
+# Visualization
+matplotlib>=3.7
+seaborn>=0.13
+shap>=0.44
+
+# Data I/O
+pyarrow>=14.0
+openpyxl>=3.1
+pyyaml>=6.0
+
+# Progress
+tqdm>=4.65
+
+# Statistics
+statsmodels>=0.14
+
+# Experiment Tracking
+mlflow>=2.10
+
+# Notebooks
+jupyter>=1.0
+ipykernel>=6.25

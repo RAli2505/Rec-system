@@ -83,7 +83,7 @@ class GraphSAGEModel(torch.nn.Module):
 # ──────────────────────────────────────────────────────────
 
 MASTERY_THRESHOLD = 0.7
-MASTERY_MIN_ANSWERS = 5
+MASTERY_MIN_ANSWERS = 2  # lowered from 5: ~80 interactions/user across 189 tags → <1 per tag avg
 PREREQ_P_FORWARD = 0.6     # P(B|A) threshold
 PREREQ_P_BACKWARD = 0.4    # P(A|B) threshold
 
@@ -107,9 +107,32 @@ class KnowledgeGraphAgent(BaseAgent):
     """
 
     name = "knowledge_graph"
+    REQUIRED_COLUMNS = {
+        "prerequisites": ["user_id", "tags", "correct", "timestamp"],
+    }
 
     def __init__(self) -> None:
         super().__init__()
+        # Seed fixing
+        _seed = self._config.get("seed", 42)
+        from .utils import set_global_seed
+        set_global_seed(_seed)
+
+        # Config-driven parameters
+        gs_cfg = self._config.get("graphsage", {})
+        self._gs_hidden = gs_cfg.get("hidden_dim", 128)
+        self._gs_output = gs_cfg.get("output_dim", 64)
+        self._gs_epochs = gs_cfg.get("epochs", 200)
+        self._gs_lr = gs_cfg.get("learning_rate", 0.01)
+        self._gs_train_split = gs_cfg.get("train_split", 0.8)
+
+        prereq_cfg = self._config.get("prerequisites", {})
+        self._prereq_p_forward = prereq_cfg.get("p_forward_threshold", PREREQ_P_FORWARD)
+        self._prereq_p_backward = prereq_cfg.get("p_backward_threshold", PREREQ_P_BACKWARD)
+        self._prereq_min_cooccurrences = prereq_cfg.get("min_cooccurrences", 50)
+        self._mastery_accuracy = prereq_cfg.get("mastery_accuracy", MASTERY_THRESHOLD)
+        self._mastery_min_answers = prereq_cfg.get("mastery_min_answers", MASTERY_MIN_ANSWERS)
+
         self.graph: nx.DiGraph = nx.DiGraph()
         self.tag_embeddings: np.ndarray | None = None
         self._user_profiles: dict[str, dict[int, dict]] = {}   # user → tag → stats
@@ -131,7 +154,10 @@ class KnowledgeGraphAgent(BaseAgent):
         if "questions_df" in kwargs and "lectures_df" in kwargs:
             self.build_graph(kwargs["questions_df"], kwargs["lectures_df"])
         if "interactions_df" in kwargs:
-            self.build_prerequisites(kwargs["interactions_df"])
+            self.build_prerequisites(
+                kwargs["interactions_df"],
+                train_user_ids=kwargs.get("train_user_ids"),
+            )
 
     def receive_message(self, message):
         super().receive_message(message)
@@ -275,9 +301,21 @@ class KnowledgeGraphAgent(BaseAgent):
     # 3. Build prerequisite edges
     # ──────────────────────────────────────────────────────
 
-    def build_prerequisites(self, interactions_df: pd.DataFrame) -> None:
+    def build_prerequisites(
+        self,
+        interactions_df: pd.DataFrame,
+        train_user_ids: set | None = None,
+    ) -> None:
         """
         Mine PREREQUISITE_OF edges from student mastery sequences.
+
+        Parameters
+        ----------
+        interactions_df : pd.DataFrame
+            Full interaction log.
+        train_user_ids : set | None
+            If provided, only use these users for prerequisite mining
+            to prevent data leakage from test users into the KG structure.
 
         Algorithm:
         1. For each student, track per-tag cumulative accuracy.
@@ -287,10 +325,22 @@ class KnowledgeGraphAgent(BaseAgent):
         4. Add directed edge A → B if P(B|A) > 0.6 and P(A|B) < 0.4.
         5. Remove cycles by dropping weakest edges.
         """
-        logger.info("Mining prerequisite relations from %d interactions ...", len(interactions_df))
-
-        # Ensure tags column is usable
+        # Filter to train users only to prevent data leakage
         df = interactions_df.copy()
+        if train_user_ids is not None:
+            df = df[df["user_id"].isin(train_user_ids)]
+            logger.info(
+                "Mining prerequisites from TRAIN users only: %d / %d interactions",
+                len(df), len(interactions_df),
+            )
+        else:
+            logger.warning(
+                "build_prerequisites called without train_user_ids — "
+                "using ALL %d interactions (potential data leakage!)",
+                len(interactions_df),
+            )
+
+        logger.info("Mining prerequisite relations from %d interactions ...", len(df))
         if "tags" not in df.columns:
             logger.warning("No 'tags' column — skipping prerequisites")
             return
@@ -316,12 +366,13 @@ class KnowledgeGraphAgent(BaseAgent):
         pair_stats: dict[tuple[int, int], dict] = {}
         tag_list = sorted(all_tags)
 
+        min_cooc = self._prereq_min_cooccurrences
         for ta, tb in combinations(tag_list, 2):
             both = sum(1 for uid in mastered_sets if ta in mastered_sets[uid] and tb in mastered_sets[uid])
             a_only = sum(1 for uid in mastered_sets if ta in mastered_sets[uid])
             b_only = sum(1 for uid in mastered_sets if tb in mastered_sets[uid])
 
-            if a_only > 0 and b_only > 0:
+            if a_only >= min_cooc and b_only >= min_cooc:
                 p_b_given_a = both / a_only   # P(mastered B | mastered A)
                 p_a_given_b = both / b_only   # P(mastered A | mastered B)
                 pair_stats[(ta, tb)] = {
@@ -330,10 +381,12 @@ class KnowledgeGraphAgent(BaseAgent):
                     "strength": p_b_given_a - p_a_given_b,
                 }
 
-        # Step 4: Add prerequisite edges
+        # Step 4: Add prerequisite edges (use instance thresholds from config)
+        pf_thresh = self._prereq_p_forward
+        pb_thresh = self._prereq_p_backward
         n_added = 0
         for (ta, tb), stats in pair_stats.items():
-            if stats["p_forward"] > PREREQ_P_FORWARD and stats["p_backward"] < PREREQ_P_BACKWARD:
+            if stats["p_forward"] > pf_thresh and stats["p_backward"] < pb_thresh:
                 self.graph.add_edge(
                     f"tag_{ta}", f"tag_{tb}",
                     edge_type="PREREQUISITE_OF",
@@ -342,7 +395,7 @@ class KnowledgeGraphAgent(BaseAgent):
                     strength=round(stats["strength"], 3),
                 )
                 n_added += 1
-            elif stats["p_backward"] > PREREQ_P_FORWARD and stats["p_forward"] < PREREQ_P_BACKWARD:
+            elif stats["p_backward"] > pf_thresh and stats["p_forward"] < pb_thresh:
                 self.graph.add_edge(
                     f"tag_{tb}", f"tag_{ta}",
                     edge_type="PREREQUISITE_OF",
@@ -373,7 +426,12 @@ class KnowledgeGraphAgent(BaseAgent):
         for _, row in df_sorted.iterrows():
             uid = str(row["user_id"])
             tags = row["tags"]
-            if not isinstance(tags, list):
+            # Parse tags from string format (e.g. "78" or "78;123") to list
+            if isinstance(tags, str):
+                tags = [int(t) for t in tags.split(";") if t.strip().lstrip('-').isdigit()]
+            elif isinstance(tags, (int, float)):
+                tags = [int(tags)]
+            elif not isinstance(tags, list):
                 continue
             correct = bool(row["correct"])
 
@@ -465,6 +523,9 @@ class KnowledgeGraphAgent(BaseAgent):
 
         Returns tag_embeddings: (n_tags, out_dim).
         """
+        from .utils import set_global_seed
+        set_global_seed(42)
+
         # Collect tag nodes
         tag_nodes = sorted(
             [n for n, d in self.graph.nodes(data=True) if d.get("node_type") == "tag"],

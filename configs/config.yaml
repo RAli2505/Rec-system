@@ -1,0 +1,187 @@
+# ════════════════════════════════════════════════════════
+# MARS Configuration — All Hyperparameters
+# ════════════════════════════════════════════════════════
+
+global:
+  seed: 42
+  seeds_for_repeats: [42, 123, 456, 789, 2024]
+  device: "auto"  # "cpu", "cuda", "auto"
+
+# ── Data Pipeline ──
+data:
+  sample_users: 10000        # loader.py: EdNetLoader.load_interactions()
+  stratified_sampling: true  # loader.py: quintile-based representative sampling
+  min_answers_per_user: 10   # preprocessor.py: MIN_ANSWERS_PER_USER
+  elapsed_min_ms: 1000       # preprocessor.py: ELAPSED_MIN_MS
+  elapsed_max_ms: 300000     # preprocessor.py: ELAPSED_MAX_MS
+  session_gap_ms: 1800000    # preprocessor.py: SESSION_GAP_MS (30 min)
+  rolling_window: 20         # preprocessor.py: ROLLING_WINDOW
+  chunked_processing: true   # preprocessor.py: batch feature engineering for >10K users
+  chunk_size: 5000           # preprocessor.py: users per batch in chunked mode
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+
+# ── DiagnosticAgent ──
+diagnostic:
+  model_type: "3PL"          # "1PL", "2PL", "3PL"
+  theta_range: [-4.0, 4.0]
+  guessing_c: 0.25           # For 3PL with 4-choice MCQ
+  min_answers_calibration: 30
+  cat_max_items: 15
+  cat_min_items: 5
+  cat_se_threshold: 0.3
+  diagnostic_n_items: 15     # 2 per part + 1 extra
+  n_parts: 7
+  prior_weight: 0.1          # Bayesian prior weight in MLE
+  median_elapsed_fallback_ms: 15000
+
+# ── ConfidenceAgent ──
+confidence:
+  n_classes: 6
+  model: "xgboost"
+  use_smote: false            # SMOTE is slow on large datasets; use class_weight
+  use_class_weight: true      # Fast alternative: inversely proportional sample weights
+  xgboost:
+    max_depth: 6
+    n_estimators: 300
+    learning_rate: 0.1
+    early_stopping_rounds: 20
+    eval_metric: "mlogloss"
+  cv_folds: 5
+  skill_deltas:               # Mapping confidence class -> delta ability
+    SOLID: 0.15
+    UNSURE_CORRECT: 0.05
+    FALSE_CONFIDENCE: -0.10
+    CLEAR_GAP: -0.15
+    DOUBT_CORRECT: 0.03
+    DOUBT_INCORRECT: -0.12
+
+# ── KGAgent ──
+knowledge_graph:
+  graphsage:
+    hidden_dim: 128
+    output_dim: 64
+    epochs: 200
+    learning_rate: 0.01
+    train_split: 0.8          # For link prediction train/test
+  prerequisites:
+    p_forward_threshold: 0.55 # P(B|A) > threshold -> edge (relaxed for larger sample)
+    p_backward_threshold: 0.35 # P(A|B) < threshold -> edge (relaxed for larger sample)
+    min_cooccurrences: 30     # Minimum shared users for pair (lowered: more users available)
+    mastery_accuracy: 0.7     # Accuracy threshold for "mastered"
+    mastery_min_answers: 5    # Minimum answers for mastery decision
+
+# ── PredictionAgent ──
+prediction:
+  model: "lstm"               # "lstm", "gru", "transformer"
+  seq_len: 50
+  horizon: 10
+  num_tags: 293
+  lstm:
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.3
+    learning_rate: 0.001
+    batch_size: 512
+    epochs: 50
+    patience: 5
+  gru:
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.3
+    learning_rate: 0.001
+    batch_size: 512
+    epochs: 50
+    patience: 5
+  transformer:
+    d_model: 128
+    nhead: 8
+    num_layers: 2
+    dim_feedforward: 256
+    dropout: 0.1
+    learning_rate: 0.0005     # Transformers need lower LR
+    batch_size: 512
+    epochs: 50
+    patience: 5
+  embeddings:
+    tag_dim: 32
+    part_dim: 8
+    conf_dim: 8
+  gap_threshold: 0.5         # P(fail) > threshold -> flagged gap
+
+# ── RecommendationAgent ──
+recommendation:
+  thompson_sampling:
+    priors:
+      knowledge_based: {alpha: 10, beta: 1}
+      content_based: {alpha: 5, beta: 1}
+      collaborative: {alpha: 1, beta: 1}
+  cf_min_interactions: 20
+  als:
+    n_factors: 64
+  sbert:
+    model_name: "all-MiniLM-L6-v2"
+  lambdamart:
+    num_leaves: 31
+    min_child_samples: 10
+    learning_rate: 0.1
+    n_estimators: 100
+  top_k: [5, 10, 20]
+
+# ── PersonalizationAgent ──
+personalization:
+  model: "kmeans"
+  k_range: [3, 8]
+  n_init: 10
+  session_gap_ms: 1800000     # 30 min in ms
+  rolling_window: 50
+  scaler: "standard"
+  random_state: 42
+
+# ── Hyperparameter Search ──
+hp_search:
+  xgboost:
+    n_iter: 50                  # RandomizedSearchCV iterations
+    cv_folds: 5
+    scoring: "f1_macro"
+    param_distributions:
+      max_depth: [4, 5, 6, 7, 8]
+      n_estimators: [100, 200, 300, 500]
+      learning_rate: [0.01, 0.05, 0.1, 0.2]
+      min_child_weight: [1, 3, 5]
+      subsample: [0.7, 0.8, 0.9, 1.0]
+      colsample_bytree: [0.7, 0.8, 0.9, 1.0]
+  lstm:
+    n_iter: 20                  # Random sample from grid
+    param_distributions:
+      hidden_dim: [64, 128, 256]
+      num_layers: [1, 2, 3]
+      dropout: [0.1, 0.2, 0.3, 0.5]
+      learning_rate: [0.0005, 0.001, 0.002]
+  lambdamart:
+    n_iter: 27                  # Full grid (3x3x3)
+    param_distributions:
+      num_leaves: [15, 31, 63]
+      min_child_samples: [5, 10, 20]
+      learning_rate: [0.05, 0.1, 0.2]
+      n_estimators: [50, 100, 200]
+  sensitivity:
+    irt_models: ["1PL", "2PL", "3PL"]
+    graphsage_hidden: [64, 128, 256]
+    graphsage_layers: [1, 2, 3]
+    kmeans_k_range: [3, 4, 5, 6, 7, 8]
+    als_factors: [32, 64, 128]
+
+# ── Orchestrator ──
+orchestrator:
+  pipelines:
+    cold_start:
+      cat_items: 15           # Number of CAT items
+    assessment:
+      enabled: true
+    continuous:
+      rerank_on_confidence_change: true
+  evaluation:
+    batch_context_ratio: 0.5  # 50/50 context/evaluation split

@@ -3,15 +3,37 @@ EdNet data preprocessor for MARS project.
 
 Cleans interactions, engineers features, and creates
 chronological train/val/test splits saved to Parquet.
+
+Supports chunked processing for large datasets (50K+ users)
+with progress reporting.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    # Fallback: no-op progress bar if tqdm not installed
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(self, iterable=None, **kwargs):
+            self._it = iterable
+        def __iter__(self):
+            return iter(self._it)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def set_postfix_str(self, s):
+            pass
+        def update(self, n=1):
+            pass
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +57,11 @@ class EdNetPreprocessor:
         self,
         output_dir: str | Path = "data/processed",
         splits_dir: str | Path = "data/splits",
+        chunk_size: int = 5_000,
     ):
         self.output_dir = Path(output_dir)
         self.splits_dir = Path(splits_dir)
+        self.chunk_size = chunk_size
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.splits_dir.mkdir(parents=True, exist_ok=True)
 
@@ -45,20 +69,46 @@ class EdNetPreprocessor:
     # Main pipeline
     # ------------------------------------------------------------------
 
-    def run(self, interactions: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    def run(
+        self,
+        interactions: pd.DataFrame,
+        chunked: bool = False,
+    ) -> dict[str, pd.DataFrame]:
         """
         Full preprocessing pipeline.
 
+        Parameters
+        ----------
+        interactions : pd.DataFrame
+            Raw interactions from EdNetLoader.
+        chunked : bool
+            If True, process feature engineering in user-batches
+            of ``self.chunk_size`` to reduce peak RAM usage.
+            Recommended for datasets with >10K users.
+
         Returns dict with keys 'train', 'val', 'test'.
         """
-        logger.info("Starting preprocessing on %d rows", len(interactions))
+        t0 = time.time()
+        n_users = interactions["user_id"].nunique()
+        logger.info(
+            "Starting preprocessing: %d rows, %d users (chunked=%s)",
+            len(interactions), n_users, chunked,
+        )
 
         df = self.clean(interactions)
-        df = self.engineer_features(df)
+
+        if chunked and n_users > self.chunk_size:
+            df = self._engineer_features_chunked(df)
+        else:
+            df = self.engineer_features(df)
+
         splits = self.chronological_split(df)
 
         # Save
         self._save(df, splits)
+
+        t_total = time.time() - t0
+        logger.info("Preprocessing complete in %.1fs", t_total)
 
         return splits
 
@@ -68,22 +118,38 @@ class EdNetPreprocessor:
 
     def clean(self, df: pd.DataFrame) -> pd.DataFrame:
         n0 = len(df)
+        n_users_0 = df["user_id"].nunique()
 
         # Remove extreme elapsed times
         if "elapsed_time" in df.columns:
             mask = df["elapsed_time"].between(ELAPSED_MIN_MS, ELAPSED_MAX_MS)
             df = df[mask | df["elapsed_time"].isna()].copy()
-            logger.info("Elapsed time filter: %d → %d rows", n0, len(df))
+            n_elapsed_removed = n0 - len(df)
+            logger.info(
+                "Elapsed time filter [%d, %d]ms: %d → %d rows (removed %d, %.1f%%)",
+                ELAPSED_MIN_MS, ELAPSED_MAX_MS, n0, len(df),
+                n_elapsed_removed, 100 * n_elapsed_removed / max(n0, 1),
+            )
 
         # Remove users with fewer than MIN_ANSWERS_PER_USER answers
         user_counts = df["user_id"].value_counts()
         valid_users = user_counts[user_counts >= MIN_ANSWERS_PER_USER].index
         n1 = len(df)
+        n_users_before = len(user_counts)
         df = df[df["user_id"].isin(valid_users)].copy()
+        n_users_removed = n_users_before - len(valid_users)
         logger.info(
-            "Min-answers filter (%d): %d → %d rows, %d → %d users",
+            "Min-answers filter (>=%d): %d → %d rows, %d → %d users "
+            "(removed %d users, %.1f%%)",
             MIN_ANSWERS_PER_USER, n1, len(df),
-            len(user_counts), len(valid_users),
+            n_users_before, len(valid_users),
+            n_users_removed, 100 * n_users_removed / max(n_users_before, 1),
+        )
+        logger.info(
+            "Cleaning summary: %d → %d rows (%.1f%% retained), "
+            "%d → %d users (%.1f%% retained)",
+            n0, len(df), 100 * len(df) / max(n0, 1),
+            n_users_0, len(valid_users), 100 * len(valid_users) / max(n_users_0, 1),
         )
 
         return df.reset_index(drop=True)
@@ -102,6 +168,84 @@ class EdNetPreprocessor:
         df = self._add_time_since_last(df)
 
         logger.info("Feature engineering complete. Columns: %s", list(df.columns))
+        return df
+
+    def _engineer_features_chunked(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Feature engineering in user-batches to limit peak RAM.
+
+        Global statistics (tag means, median elapsed) are computed once
+        on the full dataset, then per-user features are computed in chunks.
+        """
+        t0 = time.time()
+        df = df.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
+
+        # --- Global stats needed across chunks ---
+        # Tag-level average elapsed time (z-scored)
+        tag_z = {}
+        if "tags" in df.columns and "elapsed_time" in df.columns:
+            exploded = df[["elapsed_time", "tags"]].explode("tags").dropna(
+                subset=["tags", "elapsed_time"]
+            )
+            exploded["tags"] = exploded["tags"].astype(int)
+            tag_mean = exploded.groupby("tags")["elapsed_time"].mean()
+            global_mean = tag_mean.mean()
+            global_std = tag_mean.std()
+            if global_std == 0 or pd.isna(global_std):
+                global_std = 1.0
+            tag_z = ((tag_mean - global_mean) / global_std).to_dict()
+
+        # --- Chunked processing ---
+        users = df["user_id"].unique()
+        n_chunks = int(np.ceil(len(users) / self.chunk_size))
+        logger.info(
+            "Chunked feature engineering: %d users in %d chunks of %d",
+            len(users), n_chunks, self.chunk_size,
+        )
+
+        chunks_out = []
+        for ci in tqdm(range(n_chunks), desc="Feature engineering"):
+            chunk_users = users[ci * self.chunk_size : (ci + 1) * self.chunk_size]
+            chunk_df = df[df["user_id"].isin(set(chunk_users))].copy()
+
+            # Per-user features
+            chunk_df = self._add_tag_accuracy(chunk_df)
+            chunk_df = self._add_avg_elapsed_by_tag_precomputed(chunk_df, tag_z)
+            chunk_df = self._add_session_id(chunk_df)
+            chunk_df = self._add_rolling_accuracy(chunk_df)
+            chunk_df = self._add_time_since_last(chunk_df)
+
+            chunks_out.append(chunk_df)
+            if (ci + 1) % 5 == 0 or ci == n_chunks - 1:
+                logger.info(
+                    "Chunk %d/%d done (%.1fs elapsed)",
+                    ci + 1, n_chunks, time.time() - t0,
+                )
+
+        result = pd.concat(chunks_out, ignore_index=True)
+        result = result.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
+        logger.info(
+            "Chunked feature engineering complete: %d rows in %.1fs",
+            len(result), time.time() - t0,
+        )
+        return result
+
+    @staticmethod
+    def _add_avg_elapsed_by_tag_precomputed(
+        df: pd.DataFrame, tag_z: dict
+    ) -> pd.DataFrame:
+        """Map pre-computed tag z-scores (used in chunked mode)."""
+        if not tag_z or "tags" not in df.columns:
+            df["avg_elapsed_by_tag"] = 0.0
+            return df
+
+        def _avg_z(tags):
+            if not isinstance(tags, list) or len(tags) == 0:
+                return 0.0
+            vals = [tag_z.get(int(t), 0.0) for t in tags]
+            return float(np.mean(vals))
+
+        df["avg_elapsed_by_tag"] = df["tags"].apply(_avg_z)
         return df
 
     @staticmethod

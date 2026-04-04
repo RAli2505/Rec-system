@@ -1,0 +1,60 @@
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#EBF0F5', 'primaryBorderColor': '#5B7BA0',
+  'lineColor': '#2C3E50', 'fontSize': '13px'
+}}}%%
+
+graph TD
+    RAW["<b>EdNet Raw Data</b><br/><i>784K students, 131M+ interactions</i>"]
+    SAMPLE["<b>User Sampling</b><br/><i>sample_users=1000 → filter min_answers ≥ 10</i>"]
+    PREP["<b>Preprocessing & Feature Engineering</b><br/><i>elapsed_time clip [1s, 300s] · session gap 30 min · 16 features</i>"]
+    SPLIT["<b>Chronological Split (per student)</b><br/><i>first 70% → Train / next 15% → Val / last 15% → Test</i>"]
+
+    RAW --> SAMPLE --> PREP --> SPLIT
+
+    TRAIN["<b>Train Data</b><br/>70% · 32,754 interactions"]
+    VAL["<b>Validation Data</b><br/>15%"]
+    TEST["<b>Test Data</b><br/>15%"]
+
+    SPLIT --> TRAIN
+    SPLIT --> VAL
+    SPLIT --> TEST
+
+    DIAG["DiagnosticAgent<br/><i>IRT 3PL calibration</i>"]
+    CONF["ConfidenceAgent<br/><i>XGBoost 6-class training</i>"]
+    KG["KnowledgeGraphAgent<br/><i>GraphSAGE + prerequisite mining</i>"]
+    PRED["PredictionAgent<br/><i>LSTM seq-to-set training</i>"]
+    REC["RecommendationAgent<br/><i>TS priors + LambdaMART fit</i>"]
+    PERS["PersonalizationAgent<br/><i>K-Means clustering (K=6)</i>"]
+
+    TRAIN --> DIAG
+    TRAIN --> CONF
+    TRAIN --> KG
+    TRAIN --> PRED
+    TRAIN --> REC
+    TRAIN --> PERS
+
+    HP["Hyperparameter tuning"]
+    EVAL["<b>Final Evaluation</b><br/><i>5 seeds · 16 metrics</i>"]
+
+    VAL --> HP
+    TEST --> EVAL
+
+    LEAK["⚠️ All agents trained on<br/>train split only (no data leakage)"]
+
+    classDef rawBox fill:#AED6F1,stroke:#5DADE2,stroke-width:2px
+    classDef procBox fill:#D5DBDB,stroke:#ABB2B9,stroke-width:1px
+    classDef splitBox fill:#FDEBD0,stroke:#E67E22,stroke-width:2px
+    classDef trainBox fill:#D5F5E3,stroke:#27AE60,stroke-width:2px
+    classDef valBox fill:#FCF3CF,stroke:#F1C40F,stroke-width:1px
+    classDef testBox fill:#FADBD8,stroke:#E74C3C,stroke-width:1px
+    classDef agentBox fill:#EBF0F5,stroke:#5B7BA0,stroke-width:1px
+    classDef warnBox fill:#FEF9E7,stroke:#E74C3C,stroke-width:1px,color:#E74C3C
+
+    class RAW rawBox
+    class SAMPLE,PREP procBox
+    class SPLIT splitBox
+    class TRAIN trainBox
+    class VAL valBox
+    class TEST testBox
+    class DIAG,CONF,KG,PRED,REC,PERS agentBox
+    class LEAK warnBox

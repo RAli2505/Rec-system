@@ -25,6 +25,8 @@ print(f"Data loaded in {time.time()-t0:.1f}s")
 
 # Build supporting agents
 kg = KnowledgeGraphAgent()
+# Note: using full interactions for testing purposes.
+# In production/evaluation, use train_df only to avoid data leakage.
 kg.build_graph(questions, lectures)
 kg.update_difficulties(interactions)
 kg.build_prerequisites(interactions)

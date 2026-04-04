@@ -1,29 +1,22 @@
 """
 Prediction Agent for MARS.
 
-Predicts future knowledge gaps per tag using an LSTM trained on
-sequences of student interactions.  Each interaction is encoded as a
-51-dimensional vector:
+Predicts future knowledge gaps per tag using a sequence encoder trained on
+student interactions.  Each interaction is encoded as a 51-dimensional vector:
 
     tag_emb(32) + correct(1) + elapsed_norm(1) + changed(1)
     + part_emb(8) + confidence_emb(8) = 51
+
+Supports three encoder architectures (configurable via ``model_type``):
+  - **LSTM** (default): O(1) incremental update, ideal for continuous pipeline
+  - **GRU**: lighter alternative, similar properties to LSTM
+  - **Transformer**: SOTA baseline for comparison, requires full re-computation
 
 The model consumes the last ``SEQ_LEN`` (50) interactions and outputs
 a (293,) sigmoid vector — the probability that the student will fail
 each tag within the next ``HORIZON`` (10) questions.
 
-Training label: binary vector marking tags the student actually failed
-in the next 10 questions after the window.
-
-Architecture
-------------
-- tag_embedding  : Embedding(NUM_TAGS, 32)   — one tag per interaction
-- part_embedding : Embedding(NUM_PARTS, 8)
-- conf_embedding : Embedding(NUM_CONF_CLASSES, 8)
-- LSTM(51, 128, num_layers=2, dropout=0.3, batch_first=True)
-- Linear(128, NUM_TAGS) → sigmoid
-
-Loss: BCELoss | Optimizer: Adam lr=1e-3 | Early stopping: patience 5
+Loss: BCEWithLogitsLoss | Optimizer: Adam lr=1e-3 | Early stopping: patience 5
 """
 
 from __future__ import annotations
@@ -40,6 +33,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from .base_agent import BaseAgent
+from .confidence_agent import DEFAULT_CONFIDENCE_N_CLASSES
 
 logger = logging.getLogger("mars.agent.prediction")
 
@@ -49,7 +43,7 @@ logger = logging.getLogger("mars.agent.prediction")
 
 NUM_TAGS = 293
 NUM_PARTS = 7           # TOEIC parts 1-7
-NUM_CONF_CLASSES = 6    # from ConfidenceAgent
+NUM_CONF_CLASSES = DEFAULT_CONFIDENCE_N_CLASSES
 SEQ_LEN = 50            # window of recent interactions
 HORIZON = 10            # predict failures within next N questions
 
@@ -63,9 +57,10 @@ NUM_LAYERS = 2
 DROPOUT = 0.3
 
 LEARNING_RATE = 1e-3
-BATCH_SIZE = 256
+BATCH_SIZE = 512
 EPOCHS = 50
 PATIENCE = 5
+NUM_WORKERS = 0 if __import__("sys").platform == "win32" else 4
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -174,7 +169,8 @@ class GapSequenceDataset(Dataset):
             all_tags_per_row = rows["tags"].apply(self._all_tags).tolist()
 
             n = len(rows)
-            for i in range(n - self.seq_len - self.horizon + 1):
+            # Stride = horizon to avoid overlapping labels (prevents data leakage)
+            for i in range(0, n - self.seq_len - self.horizon + 1, self.horizon):
                 # Input sequence: rows [i : i+seq_len]
                 seq = np.stack([
                     tag_ids[i:i + self.seq_len],
@@ -235,12 +231,13 @@ class GapPredictionLSTM(nn.Module):
     Output: Linear(128, 293) → sigmoid
     """
 
-    def __init__(self) -> None:
+    def __init__(self, num_conf_classes: int = NUM_CONF_CLASSES) -> None:
         super().__init__()
+        self.num_conf_classes = num_conf_classes
 
         self.tag_embedding = nn.Embedding(NUM_TAGS, TAG_EMB_DIM, padding_idx=0)
         self.part_embedding = nn.Embedding(NUM_PARTS, PART_EMB_DIM)
-        self.confidence_embedding = nn.Embedding(NUM_CONF_CLASSES, CONF_EMB_DIM)
+        self.confidence_embedding = nn.Embedding(num_conf_classes, CONF_EMB_DIM)
 
         self.lstm = nn.LSTM(
             input_size=INPUT_DIM,
@@ -268,7 +265,7 @@ class GapPredictionLSTM(nn.Module):
         elapsed = x[:, :, 2:3]          # (B, T, 1)
         changed = x[:, :, 3:4]          # (B, T, 1)
         part_ids = x[:, :, 4].long().clamp(0, NUM_PARTS - 1)
-        conf_ids = x[:, :, 5].long().clamp(0, NUM_CONF_CLASSES - 1)
+        conf_ids = x[:, :, 5].long().clamp(0, self.num_conf_classes - 1)
 
         tag_emb = self.tag_embedding(tag_ids)       # (B, T, 32)
         part_emb = self.part_embedding(part_ids)     # (B, T, 8)
@@ -280,7 +277,151 @@ class GapPredictionLSTM(nn.Module):
         lstm_out, _ = self.lstm(combined)            # (B, T, 128)
         last_hidden = lstm_out[:, -1, :]             # (B, 128)
         logits = self.fc(last_hidden)                # (B, 293)
-        return torch.sigmoid(logits)
+        return logits  # raw logits; use BCEWithLogitsLoss for training
+
+
+class GapPredictionGRU(nn.Module):
+    """
+    GRU variant — same architecture as LSTM but with GRU cells.
+
+    Fewer parameters (no cell state), slightly faster training.
+    Same input/output format for fair comparison.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = HIDDEN_DIM,
+        num_layers: int = NUM_LAYERS,
+        dropout: float = DROPOUT,
+        num_conf_classes: int = NUM_CONF_CLASSES,
+    ) -> None:
+        super().__init__()
+        self.num_conf_classes = num_conf_classes
+
+        self.tag_embedding = nn.Embedding(NUM_TAGS, TAG_EMB_DIM, padding_idx=0)
+        self.part_embedding = nn.Embedding(NUM_PARTS, PART_EMB_DIM)
+        self.confidence_embedding = nn.Embedding(num_conf_classes, CONF_EMB_DIM)
+
+        self.gru = nn.GRU(
+            input_size=INPUT_DIM,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True,
+        )
+
+        self.fc = nn.Linear(hidden_dim, NUM_TAGS)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tag_ids = x[:, :, 0].long().clamp(0, NUM_TAGS - 1)
+        correct = x[:, :, 1:2]
+        elapsed = x[:, :, 2:3]
+        changed = x[:, :, 3:4]
+        part_ids = x[:, :, 4].long().clamp(0, NUM_PARTS - 1)
+        conf_ids = x[:, :, 5].long().clamp(0, self.num_conf_classes - 1)
+
+        tag_emb = self.tag_embedding(tag_ids)
+        part_emb = self.part_embedding(part_ids)
+        conf_emb = self.confidence_embedding(conf_ids)
+
+        combined = torch.cat([tag_emb, correct, elapsed, changed, part_emb, conf_emb], dim=-1)
+
+        gru_out, _ = self.gru(combined)
+        last_hidden = gru_out[:, -1, :]
+        return self.fc(last_hidden)
+
+
+class GapPredictionTransformer(nn.Module):
+    """
+    Transformer encoder for seq-to-set knowledge gap prediction.
+
+    Same input/output format as LSTM/GRU for fair comparison.
+    Uses learnable positional encoding and causal self-attention.
+
+    Key difference: no recurrent state — requires full sequence
+    re-computation for each new interaction (O(T) vs O(1) for LSTM).
+    """
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        nhead: int = 8,
+        num_layers: int = 2,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+        seq_len: int = SEQ_LEN,
+        num_conf_classes: int = NUM_CONF_CLASSES,
+    ) -> None:
+        super().__init__()
+        self.num_conf_classes = num_conf_classes
+
+        self.tag_embedding = nn.Embedding(NUM_TAGS, TAG_EMB_DIM, padding_idx=0)
+        self.part_embedding = nn.Embedding(NUM_PARTS, PART_EMB_DIM)
+        self.confidence_embedding = nn.Embedding(num_conf_classes, CONF_EMB_DIM)
+
+        self.input_proj = nn.Linear(INPUT_DIM, d_model)
+        self.pos_encoding = nn.Parameter(
+            torch.randn(1, seq_len, d_model) * 0.02
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers
+        )
+
+        self.fc = nn.Linear(d_model, NUM_TAGS)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tag_ids = x[:, :, 0].long().clamp(0, NUM_TAGS - 1)
+        correct = x[:, :, 1:2]
+        elapsed = x[:, :, 2:3]
+        changed = x[:, :, 3:4]
+        part_ids = x[:, :, 4].long().clamp(0, NUM_PARTS - 1)
+        conf_ids = x[:, :, 5].long().clamp(0, self.num_conf_classes - 1)
+
+        tag_emb = self.tag_embedding(tag_ids)
+        part_emb = self.part_embedding(part_ids)
+        conf_emb = self.confidence_embedding(conf_ids)
+
+        combined = torch.cat([tag_emb, correct, elapsed, changed, part_emb, conf_emb], dim=-1)
+
+        # Project to d_model and add positional encoding
+        h = self.input_proj(combined) + self.pos_encoding[:, :combined.size(1), :]
+
+        # Causal mask: each position can only attend to itself and earlier
+        seq_len = h.size(1)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(h.device)
+
+        h = self.transformer(h, mask=causal_mask)
+        last_hidden = h[:, -1, :]
+        return self.fc(last_hidden)
+
+
+# ──────────────────────────────────────────────────────────
+# Model factory
+# ──────────────────────────────────────────────────────────
+
+MODEL_REGISTRY = {
+    "lstm": GapPredictionLSTM,
+    "gru": GapPredictionGRU,
+    "transformer": GapPredictionTransformer,
+}
+
+
+def create_model(model_type: str = "lstm", **kwargs) -> nn.Module:
+    """Create a gap prediction model by name."""
+    if model_type not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unknown model_type '{model_type}'. "
+            f"Available: {list(MODEL_REGISTRY.keys())}"
+        )
+    return MODEL_REGISTRY[model_type](**kwargs)
 
 
 # ──────────────────────────────────────────────────────────
@@ -289,17 +430,43 @@ class GapPredictionLSTM(nn.Module):
 
 class PredictionAgent(BaseAgent):
     """
-    LSTM-based knowledge gap prediction agent.
+    Sequence-based knowledge gap prediction agent.
 
+    Supports LSTM (default), GRU, and Transformer encoders.
     Predicts which tags a student is likely to fail in the near future,
     enabling proactive recommendations.
     """
 
     name = "prediction"
+    REQUIRED_COLUMNS = {
+        "train": ["user_id", "timestamp", "tags", "correct",
+                  "elapsed_time", "changed_answer", "part_id", "confidence_class"],
+        "predict": ["tags", "correct", "elapsed_time", "changed_answer",
+                    "part_id", "confidence_class"],
+    }
 
-    def __init__(self) -> None:
+    def __init__(self, model_type: str | None = None) -> None:
         super().__init__()
-        self.model: GapPredictionLSTM | None = None
+        # Seed fixing
+        _seed = self._config.get("seed", 42)
+        from .utils import set_global_seed
+        set_global_seed(_seed)
+
+        # Model type from argument or config
+        self.model_type = model_type or self._config.get("model", "lstm")
+        self._num_conf_classes = int(
+            self._config.get("n_confidence_classes", NUM_CONF_CLASSES)
+        )
+
+        # Config-driven parameters (use model-specific section if available)
+        model_cfg = self._config.get(self.model_type, self._config.get("lstm", {}))
+        self._batch_size = model_cfg.get("batch_size", BATCH_SIZE)
+        self._epochs = model_cfg.get("epochs", EPOCHS)
+        self._lr = model_cfg.get("learning_rate", LEARNING_RATE)
+        self._patience = model_cfg.get("patience", PATIENCE)
+        self._gap_threshold = self._config.get("gap_threshold", 0.5)
+
+        self.model: nn.Module | None = None
         self._models_dir = Path("models")
         self._user_sequences: dict[str, list[np.ndarray]] = {}  # user → recent interactions
         self._training_metrics: dict[str, Any] = {}
@@ -309,9 +476,13 @@ class PredictionAgent(BaseAgent):
     # BaseAgent interface
     # ──────────────────────────────────────────────────────
 
+    def set_confidence_schema(self, n_classes: int) -> None:
+        """Update the confidence embedding cardinality for this agent."""
+        self._num_conf_classes = int(max(2, n_classes))
+
     def initialize(self, **kwargs: Any) -> None:
         """Load a pre-trained model or train from scratch."""
-        model_path = self._models_dir / "gap_lstm.pt"
+        model_path = self._models_dir / f"gap_{self.model_type}.pt"
         if model_path.exists():
             self._load_model(model_path)
             logger.info("Loaded pre-trained LSTM from %s", model_path)
@@ -341,13 +512,15 @@ class PredictionAgent(BaseAgent):
         self,
         interactions_df: pd.DataFrame,
         val_df: pd.DataFrame | None = None,
-        epochs: int = EPOCHS,
-        batch_size: int = BATCH_SIZE,
-        lr: float = LEARNING_RATE,
-        patience: int = PATIENCE,
+        epochs: int | None = None,
+        batch_size: int | None = None,
+        lr: float | None = None,
+        patience: int | None = None,
     ) -> dict[str, float]:
         """
         Train the GapPredictionLSTM on interaction sequences.
+
+        Sets global seed for reproducibility before training.
 
         Parameters
         ----------
@@ -365,7 +538,21 @@ class PredictionAgent(BaseAgent):
         -------
         dict with training metrics: train_loss, val_loss, val_auc, best_epoch
         """
+        # Resolve parameters from config
+        if epochs is None:
+            epochs = self._epochs
+        if batch_size is None:
+            batch_size = self._batch_size
+        if lr is None:
+            lr = self._lr
+        if patience is None:
+            patience = self._patience
+
+        from .utils import set_global_seed
+        set_global_seed(self._config.get("seed", 42))
+
         self._set_processing()
+        self._validate_dataframe(interactions_df, "train")
         logger.info("Building training sequences...")
 
         # Split into train/val if no val_df provided
@@ -389,11 +576,13 @@ class PredictionAgent(BaseAgent):
 
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=0, pin_memory=True,
+            num_workers=NUM_WORKERS, pin_memory=True,
+            persistent_workers=NUM_WORKERS > 0,
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=0, pin_memory=True,
+            num_workers=NUM_WORKERS, pin_memory=True,
+            persistent_workers=NUM_WORKERS > 0,
         ) if len(val_dataset) > 0 else None
 
         logger.info(
@@ -402,8 +591,12 @@ class PredictionAgent(BaseAgent):
         )
 
         # ── Model, loss, optimizer ──
-        model = GapPredictionLSTM().to(DEVICE)
-        criterion = nn.BCELoss()
+        model = create_model(
+            self.model_type,
+            num_conf_classes=self._num_conf_classes,
+        ).to(DEVICE)
+        logger.info("Using %s encoder (%s)", self.model_type, model.__class__.__name__)
+        criterion = nn.BCEWithLogitsLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
         # ── Training loop ──
@@ -481,13 +674,15 @@ class PredictionAgent(BaseAgent):
 
         # Save model
         self._models_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), self._models_dir / "gap_lstm.pt")
+        model_filename = f"gap_{self.model_type}.pt"
+        torch.save(model.state_dict(), self._models_dir / model_filename)
 
         self._training_metrics = {
             "best_epoch": best_epoch,
             "train_loss": round(history["train_loss"][best_epoch - 1], 4) if best_epoch > 0 else round(avg_train_loss, 4),
             "val_loss": round(best_val_loss, 4),
             "val_auc": round(val_auc, 4),
+            "model_type": self.model_type,
             "n_train_sequences": len(train_dataset),
             "n_val_sequences": len(val_dataset) if val_dataset else 0,
             "total_epochs": len(history["train_loss"]),
@@ -516,7 +711,7 @@ class PredictionAgent(BaseAgent):
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch = X_batch.to(DEVICE)
-                preds = model(X_batch).cpu().numpy()
+                preds = torch.sigmoid(model(X_batch)).cpu().numpy()
                 all_preds.append(preds)
                 all_labels.append(y_batch.numpy())
 
@@ -599,7 +794,7 @@ class PredictionAgent(BaseAgent):
         self.model.eval()
         with torch.no_grad():
             x = torch.from_numpy(seq).unsqueeze(0).to(DEVICE)  # (1, SEQ_LEN, 6)
-            probs = self.model(x).squeeze(0).cpu().numpy()      # (293,)
+            probs = torch.sigmoid(self.model(x)).squeeze(0).cpu().numpy()  # (293,)
 
         # Build gap list
         gaps = []
@@ -672,7 +867,7 @@ class PredictionAgent(BaseAgent):
         part_id = int(interaction.get("part_id", 1)) - 1
         part_id = min(max(part_id, 0), NUM_PARTS - 1)
         conf_class = int(interaction.get("confidence_class", 0))
-        conf_class = min(max(conf_class, 0), NUM_CONF_CLASSES - 1)
+        conf_class = min(max(conf_class, 0), self._num_conf_classes - 1)
 
         vec = np.array([tag_id, correct, elapsed, changed, part_id, conf_class],
                        dtype=np.float32)
@@ -692,7 +887,7 @@ class PredictionAgent(BaseAgent):
             self.model.eval()
             with torch.no_grad():
                 x = torch.from_numpy(seq).unsqueeze(0).to(DEVICE)
-                probs = self.model(x).squeeze(0).cpu().numpy()
+                probs = torch.sigmoid(self.model(x)).squeeze(0).cpu().numpy()
 
             n_at_risk = int((probs >= 0.5).sum())
             top_risks = [
@@ -760,7 +955,7 @@ class PredictionAgent(BaseAgent):
             part_id = min(max(part_id, 0), NUM_PARTS - 1)
 
             conf_class = int(row.get("confidence_class", 0))
-            conf_class = min(max(conf_class, 0), NUM_CONF_CLASSES - 1)
+            conf_class = min(max(conf_class, 0), self._num_conf_classes - 1)
 
             vecs.append(np.array([tag_id, correct, elapsed, changed, part_id, conf_class],
                                  dtype=np.float32))
@@ -777,7 +972,10 @@ class PredictionAgent(BaseAgent):
 
     def _load_model(self, path: Path) -> None:
         """Load model weights from disk."""
-        model = GapPredictionLSTM().to(DEVICE)
+        model = create_model(
+            self.model_type,
+            num_conf_classes=self._num_conf_classes,
+        ).to(DEVICE)
         model.load_state_dict(torch.load(path, map_location=DEVICE, weights_only=True))
         model.eval()
         self.model = model

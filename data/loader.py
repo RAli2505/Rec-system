@@ -4,11 +4,15 @@ EdNet data loader for MARS project.
 Loads EdNet KT2 interactions + metadata (questions, lectures),
 computes derived features (correct, elapsed_time, changed_answer, response_count),
 and returns a unified interactions DataFrame.
+
+Supports stratified sampling by user activity quintiles for
+representative subsets (important for publication-grade experiments).
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -116,8 +120,9 @@ class EdNetLoader:
 
     def load_interactions(
         self,
-        sample_users: Optional[int] = None,
+        sample_users: Optional[int] = 50_000,
         random_seed: int = 42,
+        stratified_sampling: bool = True,
     ) -> pd.DataFrame:
         """
         Load KT2 files, join with questions metadata, and compute derived features.
@@ -125,10 +130,14 @@ class EdNetLoader:
         Parameters
         ----------
         sample_users : int, optional
-            Number of students to sample (for quick experiments).
-            If None, load all.
+            Number of students to sample. Default 50,000 for publication-grade
+            experiments. Use 1000 for quick debug runs. If None, load all.
         random_seed : int
             Seed for reproducible user sampling.
+        stratified_sampling : bool
+            If True, sample proportionally from 5 activity quintiles
+            (by number of file lines) to ensure representativeness.
+            If False, use uniform random sampling (legacy behaviour).
 
         Returns
         -------
@@ -137,36 +146,117 @@ class EdNetLoader:
             tags (list), correct (bool), elapsed_time (ms),
             changed_answer (bool), response_count (int), source (str)
         """
+        t_start = time.time()
+
         # Ensure questions are loaded (needed for correct_answer)
         questions = self.questions
 
         # Discover user files
         user_files = self._list_kt2_users()
-        logger.info("Found %d user files in KT2/", len(user_files))
+        n_total = len(user_files)
+        logger.info("Found %d user files in KT2/", n_total)
 
-        if sample_users is not None and sample_users < len(user_files):
-            rng = np.random.RandomState(random_seed)
-            idx = rng.choice(len(user_files), size=sample_users, replace=False)
-            user_files = [user_files[i] for i in sorted(idx)]
-            logger.info("Sampled %d users", sample_users)
+        if sample_users is not None and sample_users < n_total:
+            if stratified_sampling:
+                user_files = self._stratified_sample(
+                    user_files, sample_users, random_seed
+                )
+            else:
+                rng = np.random.RandomState(random_seed)
+                idx = rng.choice(n_total, size=sample_users, replace=False)
+                user_files = [user_files[i] for i in sorted(idx)]
+            logger.info(
+                "Sampled %d / %d users (%.1f%%) — stratified=%s",
+                len(user_files), n_total,
+                100 * len(user_files) / n_total, stratified_sampling,
+            )
 
         # Load all selected users
+        t_load = time.time()
         dfs = []
+        n_skipped = 0
         for i, fpath in enumerate(user_files):
             try:
                 dfs.append(self._load_single_user(fpath))
             except Exception as e:
                 logger.warning("Skipping %s: %s", fpath.name, e)
+                n_skipped += 1
             if (i + 1) % 5000 == 0:
-                logger.info("Loaded %d / %d users", i + 1, len(user_files))
+                elapsed = time.time() - t_load
+                logger.info(
+                    "Loaded %d / %d users (%.1fs elapsed)",
+                    i + 1, len(user_files), elapsed,
+                )
+
+        if n_skipped > 0:
+            logger.warning(
+                "Skipped %d / %d files (%.1f%%)",
+                n_skipped, len(user_files), 100 * n_skipped / len(user_files),
+            )
 
         raw = pd.concat(dfs, ignore_index=True)
-        logger.info("Raw KT2 rows: %d", len(raw))
+        t_concat = time.time()
+        logger.info(
+            "Raw KT2 rows: %d from %d users (load: %.1fs)",
+            len(raw), len(dfs), t_concat - t_load,
+        )
 
         # Derive features from action sequences
         interactions = self._derive_features(raw, questions)
-        logger.info("Final interactions: %d rows, %d users", len(interactions), interactions["user_id"].nunique())
+        t_end = time.time()
+        logger.info(
+            "Final interactions: %d rows, %d users "
+            "(derive: %.1fs, total: %.1fs)",
+            len(interactions), interactions["user_id"].nunique(),
+            t_end - t_concat, t_end - t_start,
+        )
         return interactions
+
+    # ------------------------------------------------------------------
+    # Stratified sampling
+    # ------------------------------------------------------------------
+
+    def _stratified_sample(
+        self,
+        user_files: list[Path],
+        n_sample: int,
+        seed: int,
+    ) -> list[Path]:
+        """
+        Sample users proportionally from 5 activity quintiles.
+
+        Activity is estimated by file size (proxy for number of
+        interactions) to avoid reading every CSV.
+        """
+        # Estimate activity from file size (fast — no I/O reads)
+        sizes = np.array([f.stat().st_size for f in user_files])
+        quintiles = pd.qcut(sizes, q=5, labels=False, duplicates="drop")
+        n_quintiles = int(quintiles.max()) + 1
+
+        rng = np.random.RandomState(seed)
+        selected_indices = []
+
+        for q in range(n_quintiles):
+            q_mask = np.where(quintiles == q)[0]
+            # Proportional allocation
+            q_n = max(1, int(round(n_sample * len(q_mask) / len(user_files))))
+            q_n = min(q_n, len(q_mask))
+            chosen = rng.choice(q_mask, size=q_n, replace=False)
+            selected_indices.extend(chosen.tolist())
+            logger.info(
+                "Quintile %d: %d users available, sampled %d "
+                "(file size range: %d–%d bytes)",
+                q + 1, len(q_mask), q_n,
+                int(sizes[q_mask].min()), int(sizes[q_mask].max()),
+            )
+
+        selected_indices.sort()
+        result = [user_files[i] for i in selected_indices]
+        logger.info(
+            "Stratified sampling: requested %d, selected %d from %d quintiles",
+            n_sample, len(result), n_quintiles,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Feature derivation

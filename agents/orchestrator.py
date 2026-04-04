@@ -40,7 +40,10 @@ class Orchestrator:
     a research prototype evaluated offline on EdNet.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, seed: int = 42) -> None:
+        from .utils import set_global_seed
+        set_global_seed(seed)
+        self._seed = seed
         self.agents: dict[str, BaseAgent] = {}
         self._message_history: list[Message] = []
 
@@ -54,7 +57,26 @@ class Orchestrator:
             logger.warning("Replacing existing agent '%s'", agent.name)
         agent.orchestrator = self
         self.agents[agent.name] = agent
+        self._sync_confidence_schema()
         logger.info("Registered agent: %s (%s)", agent.name, agent.__class__.__name__)
+
+    def _sync_confidence_schema(self) -> None:
+        """Propagate confidence schema to downstream agents when available."""
+        confidence = self.agents.get(CONFIDENCE)
+        if confidence is None:
+            return
+
+        n_classes = getattr(confidence, "n_classes", None)
+        if n_classes is None:
+            return
+
+        for name in (PREDICTION, RECOMMENDATION, PERSONALIZATION):
+            agent = self.agents.get(name)
+            if agent is None:
+                continue
+            setter = getattr(agent, "set_confidence_schema", None)
+            if callable(setter):
+                setter(n_classes)
 
     def initialize_all(self, **kwargs: Any) -> None:
         """Call ``initialize()`` on every registered agent."""
@@ -303,12 +325,15 @@ class Orchestrator:
         confidence._set_idle()
         result["confidence"] = conf_result
 
+        interaction_with_conf = dict(interaction)
+        interaction_with_conf["confidence_class"] = conf_result.get("class", 0)
+
         # Step 2: Incremental IRT update
         diagnostic = self.get_agent(DIAGNOSTIC)
         diagnostic._set_processing()
         diag_result = diagnostic.update_ability(  # type: ignore[attr-defined]
             user_id=user_id,
-            interaction=interaction,
+            interaction=interaction_with_conf,
             confidence=conf_result,
         )
         diagnostic._set_idle()
@@ -319,7 +344,7 @@ class Orchestrator:
         prediction._set_processing()
         pred_result = prediction.update_state(  # type: ignore[attr-defined]
             user_id=user_id,
-            interaction=interaction,
+            interaction=interaction_with_conf,
         )
         prediction._set_idle()
         result["prediction"] = pred_result
@@ -346,12 +371,22 @@ class Orchestrator:
         self,
         test_df: pd.DataFrame,
         top_k: int = 10,
+        context_ratio: float = 0.5,
     ) -> dict[str, float]:
         """
         Run the full system on a test set and compute recommendation metrics.
 
         Groups interactions by user, processes each user through the
         assessment pipeline, and collects predictions vs ground truth.
+
+        Parameters
+        ----------
+        test_df : pd.DataFrame
+            Test interactions.
+        top_k : int
+            Number of recommendations to evaluate.
+        context_ratio : float
+            Fraction of each user's interactions used as context (default 0.5).
 
         Returns
         -------
@@ -374,8 +409,8 @@ class Orchestrator:
         for i, uid in enumerate(user_ids):
             user_df = test_df[test_df["user_id"] == uid].sort_values("timestamp")
 
-            # Use first 50% of user's test interactions as "context"
-            split_idx = max(1, len(user_df) // 2)
+            # Use first context_ratio of user's test interactions as "context"
+            split_idx = max(1, int(len(user_df) * context_ratio))
             context = user_df.iloc[:split_idx]
             ground_truth = user_df.iloc[split_idx:]
 

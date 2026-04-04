@@ -1,0 +1,33 @@
+{
+  "n_users": 390,
+  "n_interactions": 46586,
+  "mars_ndcg_10": "0.2971 ± 0.0000",
+  "mars_auc_roc": "0.5603 ± 0.0000",
+  "mars_map_10": "0.2029 ± 0.0000",
+  "best_baseline": "Binary-conf",
+  "best_baseline_ndcg_10": 0.2970,
+  "improvement_over_best": "0.03%",
+  "p_value_vs_best": "1.0 (ns)",
+  "ablation_biggest_drop": "0.2817 (agent: LSTM prediction)",
+  "confidence_f1": 1.0,
+  "irt_person_reliability": "N/A (no theta estimates; item discrimination mean=0.9528, difficulty var=1.5492)",
+  "irt_items": 2274,
+  "irt_discrimination_mean": 0.9528,
+  "irt_difficulty_mean": -0.5481,
+  "kg_link_pred_auc": 0.5000,
+  "kg_nodes": 14491,
+  "kg_edges": 46122,
+  "silhouette": 0.4161,
+  "calinski_harabasz": 177.6,
+  "davies_bouldin": 0.573,
+  "optimal_k": 6,
+  "seeds": [42, 123, 456, 789, 2024],
+  "methods_evaluated": 10,
+  "ablation_drops_ndcg10": {
+    "LSTM_prediction": 0.2817,
+    "LambdaMART": 0.0238,
+    "Thompson_Sampling": 0.0149,
+    "6_class_confidence": 0.0001,
+    "Knowledge_Graph": 0.0000
+  }
+}

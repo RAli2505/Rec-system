@@ -34,6 +34,10 @@ from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 from .base_agent import BaseAgent
+from .confidence_agent import (
+    DEFAULT_CONFIDENCE_N_CLASSES,
+    count_risk_confidence_events,
+)
 
 logger = logging.getLogger("mars.agent.personalization")
 
@@ -311,9 +315,28 @@ class PersonalizationAgent(BaseAgent):
     """
 
     name = "personalization"
+    REQUIRED_COLUMNS = {
+        "train": ["user_id", "timestamp", "correct", "elapsed_time",
+                  "changed_answer", "part_id"],
+    }
 
     def __init__(self) -> None:
         super().__init__()
+        # Seed fixing
+        _seed = self._config.get("random_state", RANDOM_STATE)
+        from .utils import set_global_seed
+        set_global_seed(_seed)
+
+        # Config-driven parameters
+        k_range_cfg = self._config.get("k_range", [3, 8])
+        self._k_range = range(k_range_cfg[0], k_range_cfg[1] + 1)
+        self._n_init = self._config.get("n_init", 10)
+        self._scaler_type = self._config.get("scaler", "standard")
+        self._random_state = _seed
+        self._n_confidence_classes = int(
+            self._config.get("n_confidence_classes", DEFAULT_CONFIDENCE_N_CLASSES)
+        )
+
         self.model: KMeans | None = None
         self.scaler: StandardScaler | None = None
         self.optimal_k: int = 0
@@ -324,6 +347,10 @@ class PersonalizationAgent(BaseAgent):
         self._cluster_centroids_raw: np.ndarray | None = None  # unscaled centroids
         self._silhouette_scores: dict[int, float] = {}
         self._inertias: dict[int, float] = {}
+
+    def set_confidence_schema(self, n_classes: int) -> None:
+        """Keep auxiliary confidence-derived features aligned with the active schema."""
+        self._n_confidence_classes = int(max(2, n_classes))
 
     # ──────────────────────────────────────────────────────
     # BaseAgent interface
@@ -363,7 +390,7 @@ class PersonalizationAgent(BaseAgent):
     def train_clusters(
         self,
         user_features_df: pd.DataFrame,
-        k_range: range = K_RANGE,
+        k_range: range | None = None,
     ) -> int:
         """
         Find optimal K via Silhouette Score and fit final K-Means.
@@ -379,6 +406,12 @@ class PersonalizationAgent(BaseAgent):
         -------
         int — the optimal K.
         """
+        if k_range is None:
+            k_range = self._k_range
+
+        from .utils import set_global_seed
+        set_global_seed(self._random_state)
+
         self._set_processing()
         self._user_features = user_features_df
 
@@ -400,7 +433,10 @@ class PersonalizationAgent(BaseAgent):
         for k in k_range:
             if k >= len(X):
                 break
-            km = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10, max_iter=300)
+            km = KMeans(
+                n_clusters=k, random_state=self._random_state,
+                n_init=self._n_init, max_iter=300,
+            )
             labels = km.fit_predict(X)
             sil = silhouette_score(X, labels)
             self._silhouette_scores[k] = round(float(sil), 4)
@@ -415,8 +451,8 @@ class PersonalizationAgent(BaseAgent):
 
         # ── Fit final model ──
         self.model = KMeans(
-            n_clusters=best_k, random_state=RANDOM_STATE,
-            n_init=10, max_iter=300,
+            n_clusters=best_k, random_state=self._random_state,
+            n_init=self._n_init, max_iter=300,
         )
         labels = self.model.fit_predict(X)
 
@@ -683,7 +719,10 @@ class PersonalizationAgent(BaseAgent):
         if confidence:
             class_names = confidence.get("class_names", [])
             if class_names:
-                n_false_conf = sum(1 for c in class_names if c == "FALSE_CONFIDENCE")
+                n_false_conf = count_risk_confidence_events(
+                    class_names,
+                    n_classes=confidence.get("n_classes", self._n_confidence_classes),
+                )
                 vec[FEATURE_NAMES.index("false_confidence_rate")] = (
                     n_false_conf / len(class_names)
                 )

@@ -1,0 +1,63 @@
+sequenceDiagram
+    autonumber
+
+    participant S as 🎓 Student
+    participant O as Orchestrator
+    participant D as DiagnosticAgent
+    participant C as ConfidenceAgent
+    participant K as KnowledgeGraphAgent
+    participant P as PredictionAgent
+    participant R as RecommendationAgent
+    participant PR as PersonalizationAgent
+
+    %% ── Pipeline 1: COLD-START ──────────────────────
+    rect rgb(214, 234, 248)
+        Note over S,PR: Pipeline 1: COLD-START (new student, < 5 answers)
+        S->>O: new_student(profile)
+        O->>D: estimate_initial_theta(prior=0.0)
+        D-->>O: θ_initial, SE
+        O->>K: get_prerequisites(all_tags)
+        K-->>O: prerequisite_graph
+        O->>R: recommend(θ, prerequisites, strategy="explore")
+        R-->>O: ranked_items (exploration-heavy)
+        O-->>S: initial_items
+    end
+
+    Note over S,PR: Student answers ≥ 5 questions...
+
+    %% ── Pipeline 2: ASSESSMENT ──────────────────────
+    rect rgb(213, 245, 227)
+        Note over S,PR: Pipeline 2: ASSESSMENT (≥ 5 answers)
+        S->>O: submit_answers(responses)
+
+        O->>D: update_theta(responses)
+        Note right of D: CAT + Bayesian update
+        D-->>O: θ_updated, SE, tag_mastery
+
+        O->>C: classify(responses, θ)
+        C-->>O: confidence_classes[6]
+
+        O->>K: identify_gaps(tag_mastery, prerequisites)
+        K-->>O: knowledge_gaps, missing_prereqs
+
+        O->>P: predict_future_gaps(sequence)
+        P-->>O: predicted_gaps[293]
+
+        O->>R: recommend(θ, gaps, confidence, predictions)
+        Note right of R: Thompson Sampling<br/>+ LambdaMART re-ranking
+        R-->>O: ranked_items
+
+        O-->>S: personalized_items
+    end
+
+    %% ── Pipeline 3: CONTINUOUS ──────────────────────
+    rect rgb(253, 235, 208)
+        Note over S,PR: Pipeline 3: CONTINUOUS (every N interactions)
+        loop Every N interactions
+            O->>PR: cluster(student_features)
+            PR-->>O: cluster_id, cluster_params
+            O->>O: adjust_agent_params(cluster_params)
+            Note over O: Adapt difficulty, strategy<br/>weights, exploration rate
+        end
+        Note over O,R: Continue Assessment Pipeline with adapted parameters
+    end

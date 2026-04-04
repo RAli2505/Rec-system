@@ -103,13 +103,33 @@ class DiagnosticAgent(BaseAgent):
     """
 
     name = "diagnostic"
+    REQUIRED_COLUMNS = {
+        "calibrate": ["user_id", "question_id", "correct"],
+    }
 
-    def __init__(self) -> None:
+    def __init__(self, seed: int | None = None) -> None:
         super().__init__()
+        # Resolve seed from config or parameter
+        _seed = seed if seed is not None else self._config.get("seed", 42)
+        from .utils import set_global_seed
+        set_global_seed(_seed)
+
+        # Load parameters from config, falling back to module-level defaults
+        theta_range = self._config.get("theta_range", list(THETA_RANGE))
+        self._theta_range = tuple(theta_range)
+        self._guessing_c = self._config.get("guessing_c", DEFAULT_GUESSING)
+        self._cat_max_items = self._config.get("cat_max_items", CAT_MAX_ITEMS)
+        self._cat_min_items = self._config.get("cat_min_items", CAT_MIN_ITEMS)
+        self._cat_se_threshold = self._config.get("cat_se_threshold", CAT_SE_THRESHOLD)
+        self._diagnostic_n_items = self._config.get("diagnostic_n_items", DIAGNOSTIC_N_ITEMS)
+        self._n_parts = self._config.get("n_parts", N_PARTS)
+        self._prior_weight = self._config.get("prior_weight", 0.1)
+
         self.irt_params: IRTParams | None = None
         self._user_abilities: dict[str, tuple[float, float]] = {}  # user → (θ, SE)
         self._qid_to_idx: dict[str, int] = {}
         self._models_dir = Path("models")
+        self._rng = np.random.RandomState(_seed)
 
     # ──────────────────────────────────────────────────────
     # BaseAgent interface
@@ -187,7 +207,7 @@ class DiagnosticAgent(BaseAgent):
                 pass
 
         # ── Guessing (c): fixed default ──
-        c = np.full(n_items, DEFAULT_GUESSING, dtype=np.float64)
+        c = np.full(n_items, self._guessing_c, dtype=np.float64)
 
         params = IRTParams(
             question_ids=question_ids,
@@ -361,12 +381,12 @@ class DiagnosticAgent(BaseAgent):
                 else:
                     ll += np.log(1 - prob)
             # Add weak N(0,1) prior for regularisation
-            ll -= 0.5 * theta**2 * 0.1
+            ll -= 0.5 * theta**2 * self._prior_weight
             return -ll
 
         result = minimize_scalar(
             neg_log_likelihood,
-            bounds=THETA_RANGE,
+            bounds=self._theta_range,
             method="bounded",
         )
         theta_hat = float(result.x)
@@ -409,7 +429,7 @@ class DiagnosticAgent(BaseAgent):
         se = 999.0
 
         # Phase 1: Cover all parts (2 per part, near current theta)
-        for part_id in range(1, N_PARTS + 1):
+        for part_id in range(1, self._n_parts + 1):
             for _ in range(2):
                 idx = self.select_next_question(theta, used, target_parts=[part_id])
                 if idx is None:
@@ -543,20 +563,24 @@ class DiagnosticAgent(BaseAgent):
 
         correct = bool(interaction.get("correct", False))
 
-        # Create a synthetic response set: prior as pseudo-observation + new
-        # Approximate: use a single item near prior_theta as anchor
+        # Build response set: stochastic pseudo-response anchor + actual response
         anchor_responses = [(idx, correct)]
 
-        # If we have prior, create a pseudo-response at prior theta
         if prior_se < 10:
-            # Find item closest to prior_theta
+            p = self.irt_params
+            # Find item closest to prior_theta for anchor
             diffs = np.abs(p.b - prior_theta)
             anchor_idx = int(np.argmin(diffs))
-            anchor_correct = prior_theta > p.b[anchor_idx]
+            # Stochastic pseudo-response based on IRT probability (not deterministic)
+            p_correct = self._p_correct(
+                prior_theta, p.a[anchor_idx], p.b[anchor_idx], p.c[anchor_idx]
+            )
+            anchor_correct = self._rng.random() < p_correct
             anchor_responses.insert(0, (anchor_idx, anchor_correct))
 
         theta, se = self.update_theta(anchor_responses)
-        # Blend with prior (Bayesian-like shrinkage)
+
+        # Bayesian-like shrinkage: blend MLE estimate with prior
         if prior_se < 10:
             w_prior = 1.0 / (prior_se**2 + 1e-10)
             w_new = 1.0 / (se**2 + 1e-10)
@@ -575,15 +599,22 @@ class DiagnosticAgent(BaseAgent):
         self,
         user_id: str,
         simulated_responses: dict[str, bool] | None = None,
-        max_items: int = CAT_MAX_ITEMS,
-        min_items: int = CAT_MIN_ITEMS,
-        se_threshold: float = CAT_SE_THRESHOLD,
+        max_items: int | None = None,
+        min_items: int | None = None,
+        se_threshold: float | None = None,
     ) -> dict[str, Any]:
         """
         Full adaptive test session with early stopping.
 
         Selects items by max Fisher information, stops when SE < threshold.
         """
+        if max_items is None:
+            max_items = self._cat_max_items
+        if min_items is None:
+            min_items = self._cat_min_items
+        if se_threshold is None:
+            se_threshold = self._cat_se_threshold
+
         p = self.irt_params
         theta = self._user_abilities.get(user_id, (0.0, 999.0))[0]
         used: set[int] = set()

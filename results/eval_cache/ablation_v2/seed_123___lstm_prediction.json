@@ -1,0 +1,19 @@
+{
+  "auc_roc": 0.4582,
+  "precision_at_5": 0.0139,
+  "precision_at_10": 0.0178,
+  "recall_at_5": 0.0032,
+  "recall_at_10": 0.0088,
+  "accuracy_at_5": 0.0032,
+  "ndcg_at_5": 0.0116,
+  "ndcg_at_10": 0.0154,
+  "ndcg_at_20": 0.0238,
+  "map_at_5": 0.0057,
+  "map_at_10": 0.0068,
+  "mrr": 0.021,
+  "coverage": 0.116,
+  "diversity": 1.0,
+  "novelty": 5.7211,
+  "cold_start_acc5": 0.0,
+  "confidence_f1": 0.0
+}

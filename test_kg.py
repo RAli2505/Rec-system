@@ -59,6 +59,8 @@ print()
 print("=" * 60)
 print("TEST 2: update_difficulties")
 print("=" * 60)
+# Note: using full interactions for testing purposes.
+# In production/evaluation, use train_df only to avoid data leakage.
 kg.update_difficulties(interactions)
 
 # Check via a known question from interactions
@@ -83,6 +85,8 @@ print()
 print("=" * 60)
 print("TEST 3: build_prerequisites")
 print("=" * 60)
+# Note: using full interactions for testing purposes.
+# In production/evaluation, use train_df only to avoid data leakage.
 kg.build_prerequisites(interactions)
 stats2 = kg.get_graph_stats()
 n_prereq = stats2["edge_types"].get("PREREQUISITE_OF", 0)

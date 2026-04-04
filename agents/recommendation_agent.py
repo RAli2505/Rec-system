@@ -30,6 +30,10 @@ import scipy.sparse as sp
 from sklearn.decomposition import TruncatedSVD
 
 from .base_agent import BaseAgent
+from .confidence_agent import (
+    DEFAULT_CONFIDENCE_N_CLASSES,
+    count_risk_confidence_events,
+)
 
 logger = logging.getLogger("mars.agent.recommendation")
 
@@ -83,9 +87,48 @@ class RecommendationAgent(BaseAgent):
 
     name = "recommendation"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        random_seed: int | None = None,
+        bandit_strategy: str | None = None,
+    ) -> None:
         super().__init__()
+        # Seed fixing
+        _seed = random_seed if random_seed is not None else self._config.get("seed", 42)
+        from .utils import set_global_seed
+        set_global_seed(_seed)
+
+        # Bandit strategy: "thompson", "ucb1", "epsilon_greedy", "fixed_kb", "fixed_round_robin"
+        self._bandit_strategy = (
+            bandit_strategy
+            or self._config.get("bandit_strategy", "thompson")
+        )
+        self._round_robin_step: dict[str, int] = {}  # per-user step counter
+        self._ucb_counts: dict[str, dict[str, int]] = {}
+        self._ucb_rewards: dict[str, dict[str, float]] = {}
+        self._ucb_total_steps: dict[str, int] = {}
+        self._epsilon = float(self._config.get("epsilon", 0.1))
+
+        # Config-driven parameters
+        self._cf_min_interactions = self._config.get("cf_min_interactions", CF_MIN_INTERACTIONS)
+        ts_cfg = self._config.get("thompson_sampling", {})
+        self._strategy_priors = ts_cfg.get("priors", DEFAULT_STRATEGY_PRIORS)
+        als_cfg = self._config.get("als", {})
+        self._als_n_factors = als_cfg.get("n_factors", 64)
+        sbert_cfg = self._config.get("sbert", {})
+        self._sbert_model_name = sbert_cfg.get("model_name", "all-MiniLM-L6-v2")
+        self._sbert_local_files_only = sbert_cfg.get("local_files_only", True)
+        lm_cfg = self._config.get("lambdamart", {})
+        self._lm_num_leaves = lm_cfg.get("num_leaves", 31)
+        self._lm_min_child = lm_cfg.get("min_child_samples", 10)
+        self._lm_lr = lm_cfg.get("learning_rate", 0.1)
+        self._lm_n_estimators = lm_cfg.get("n_estimators", 100)
+        self._n_confidence_classes = int(
+            self._config.get("n_confidence_classes", DEFAULT_CONFIDENCE_N_CLASSES)
+        )
+
         self._models_dir = Path("models")
+        self._rng = np.random.RandomState(_seed)
 
         # Thompson Sampling state per user
         self._ts_params: dict[str, dict[str, dict[str, float]]] = {}
@@ -112,6 +155,10 @@ class RecommendationAgent(BaseAgent):
 
         # KG agent reference (set by orchestrator)
         self._kg_agent = None
+
+    def set_confidence_schema(self, n_classes: int) -> None:
+        """Update the active confidence schema for downstream ranking features."""
+        self._n_confidence_classes = int(max(2, n_classes))
 
     # ──────────────────────────────────────────────────────
     # BaseAgent interface
@@ -173,8 +220,11 @@ class RecommendationAgent(BaseAgent):
         """
         from sentence_transformers import SentenceTransformer
 
-        logger.info("Loading MiniLM-L6-v2 for content-based encoding ...")
-        self._sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
+        logger.info("Loading %s for content-based encoding ...", self._sbert_model_name)
+        self._sbert_model = SentenceTransformer(
+            self._sbert_model_name,
+            local_files_only=self._sbert_local_files_only,
+        )
 
         # Build descriptions for lectures
         items = []
@@ -399,21 +449,85 @@ class RecommendationAgent(BaseAgent):
 
     def select_strategy(self, user_id: str, n_interactions: int = 0) -> str:
         """
-        Thompson Sampling: sample from Beta(α, β) for each strategy,
-        pick the one with highest sample.
+        Select a recommendation strategy using the configured bandit policy.
+
+        Supported policies:
+          - "thompson"         — Thompson Sampling with Beta(α, β) posteriors
+          - "ucb1"             — UCB1: mean + sqrt(2·ln(t) / n_i)
+          - "epsilon_greedy"   — ε-greedy (ε=0.1): random 10% of the time
+          - "fixed_kb"         — always knowledge-based (no exploration)
+          - "fixed_round_robin" — KB → CB → CF → KB → … (deterministic)
 
         Collaborative is only eligible when n_interactions >= CF_MIN_INTERACTIONS.
         """
-        params = self._get_ts_params(user_id)
+        eligible = ["knowledge_based", "content_based"]
+        if n_interactions >= self._cf_min_interactions:
+            eligible.append("collaborative")
 
+        bs = self._bandit_strategy
+
+        # ── Fixed: always knowledge-based ──
+        if bs == "fixed_kb":
+            return "knowledge_based"
+
+        # ── Fixed: round-robin ──
+        if bs == "fixed_round_robin":
+            step = self._round_robin_step.get(user_id, 0)
+            strategy = eligible[step % len(eligible)]
+            self._round_robin_step[user_id] = step + 1
+            return strategy
+
+        # ── ε-greedy ──
+        if bs == "epsilon_greedy":
+            if self._rng.random() < self._epsilon:
+                return eligible[self._rng.randint(len(eligible))]
+            # Exploit: pick strategy with highest average reward
+            params = self._get_ts_params(user_id)
+            best_s, best_v = eligible[0], -1.0
+            for s in eligible:
+                ab = params.get(s, {"alpha": 1, "beta": 1})
+                avg = ab["alpha"] / (ab["alpha"] + ab["beta"])
+                if avg > best_v:
+                    best_v = avg
+                    best_s = s
+            return best_s
+
+        # ── UCB1 ──
+        if bs == "ucb1":
+            if user_id not in self._ucb_counts:
+                self._ucb_counts[user_id] = {s: 0 for s in eligible}
+                self._ucb_rewards[user_id] = {s: 0.0 for s in eligible}
+                self._ucb_total_steps[user_id] = 0
+
+            counts = self._ucb_counts[user_id]
+            rewards = self._ucb_rewards[user_id]
+            total = self._ucb_total_steps[user_id] + 1
+
+            # Ensure new strategies get at least one try
+            for s in eligible:
+                if counts.get(s, 0) == 0:
+                    return s
+
+            best_s, best_v = eligible[0], -1.0
+            for s in eligible:
+                n_i = counts.get(s, 1)
+                avg = rewards.get(s, 0.0) / max(n_i, 1)
+                exploration = np.sqrt(2.0 * np.log(total) / n_i)
+                v = avg + exploration
+                if v > best_v:
+                    best_v = v
+                    best_s = s
+            return best_s
+
+        # ── Thompson Sampling (default) ──
+        params = self._get_ts_params(user_id)
         best_strategy = "knowledge_based"
         best_sample = -1.0
 
         for strategy, ab in params.items():
-            # Skip collaborative if not enough data
-            if strategy == "collaborative" and n_interactions < CF_MIN_INTERACTIONS:
+            if strategy not in eligible:
                 continue
-            sample = np.random.beta(ab["alpha"], ab["beta"])
+            sample = self._rng.beta(ab["alpha"], ab["beta"])
             if sample > best_sample:
                 best_sample = sample
                 best_strategy = strategy
@@ -428,16 +542,24 @@ class RecommendationAgent(BaseAgent):
         **kwargs: Any,
     ) -> None:
         """
-        Update Thompson Sampling posterior.
+        Update bandit posterior / statistics for the selected strategy.
 
         reward=1 if the recommended tag accuracy improved, else 0.
+        Works for all bandit policies (TS posteriors, UCB1 counts, ε-greedy averages).
         """
+        # Thompson Sampling / ε-greedy (share the same Beta params)
         params = self._get_ts_params(user_id)
         if strategy in params:
             params[strategy]["alpha"] += reward
             params[strategy]["beta"] += (1.0 - reward)
             logger.debug("TS update %s/%s: alpha=%.1f, beta=%.1f",
                          user_id, strategy, params[strategy]["alpha"], params[strategy]["beta"])
+
+        # UCB1 counts
+        if user_id in self._ucb_counts:
+            self._ucb_counts[user_id][strategy] = self._ucb_counts[user_id].get(strategy, 0) + 1
+            self._ucb_rewards[user_id][strategy] = self._ucb_rewards[user_id].get(strategy, 0.0) + reward
+            self._ucb_total_steps[user_id] = self._ucb_total_steps.get(user_id, 0) + 1
 
     def get_ts_weights(self, user_id: str) -> dict[str, float]:
         """Return current expected weight for each strategy."""
@@ -685,8 +807,9 @@ class RecommendationAgent(BaseAgent):
             profile["part_accuracy"] = {str(k): round(float(v), 3) for k, v in pa.items()}
 
         if confidence_result and "class_names" in confidence_result:
-            profile["false_confidence_count"] = sum(
-                1 for cn in confidence_result["class_names"] if cn == "FALSE_CONFIDENCE"
+            profile["false_confidence_count"] = count_risk_confidence_events(
+                confidence_result["class_names"],
+                n_classes=confidence_result.get("n_classes", self._n_confidence_classes),
             )
 
         self._user_profiles[user_id] = profile

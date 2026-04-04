@@ -1,0 +1,72 @@
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#EBF0F5', 'primaryBorderColor': '#5B7BA0',
+  'lineColor': '#2C3E50', 'textColor': '#2C3E50',
+  'fontSize': '14px'
+}}}%%
+
+graph TD
+    %% ── Input Layer ──────────────────────────────────
+    DS["<b>EdNet KT2 Dataset</b><br/>784K students, 131M+ interactions"]
+    PP["<b>Data Preprocessing</b><br/>Feature Engineering"]
+    SP["<b>Chronological Split</b><br/>70% Train / 15% Val / 15% Test"]
+
+    DS --> PP --> SP
+
+    %% ── Orchestrator ────────────────────────────────
+    subgraph ORCH ["<b>ORCHESTRATOR</b>"]
+        direction TB
+
+        subgraph PIPES [" "]
+            direction LR
+            P1["🧊 Cold-Start<br/>Pipeline"]
+            P2["📋 Assessment<br/>Pipeline"]
+            P3["🔄 Continuous<br/>Pipeline"]
+        end
+
+        subgraph ROW1 [" "]
+            direction LR
+            DIAG["<b>DiagnosticAgent</b><br/><i>IRT 3PL + CAT</i><br/>θ estimation"]
+            CONF["<b>ConfidenceAgent</b><br/><i>XGBoost → 6-class</i><br/>confidence classification"]
+        end
+
+        subgraph ROW2 [" "]
+            direction LR
+            KG["<b>KnowledgeGraphAgent</b><br/><i>GraphSAGE embeddings</i><br/>+ Prerequisite graph"]
+            PRED["<b>PredictionAgent</b><br/><i>LSTM seq-to-set</i><br/>→ 293-dim gap vector"]
+        end
+
+        REC["<b>RecommendationAgent</b><br/><i>Thompson Sampling + LambdaMART</i><br/>12 ranking features"]
+        PERS["<b>PersonalizationAgent</b><br/><i>K-Means (K=6)</i><br/>+ adaptive params"]
+
+        %% ── Data flow arrows ──
+        DIAG -->|"θ (ability)"| KG
+        DIAG -->|"θ"| REC
+        CONF -->|"confidence_class"| PRED
+        CONF -->|"conf_class"| REC
+        KG -->|"prerequisites & gaps"| REC
+        PRED -->|"gap_probs[293]"| REC
+        REC -->|"ranked items"| PERS
+    end
+
+    SP --> ORCH
+
+    %% ── Output Layer ────────────────────────────────
+    OUT["<b>Personalized Recommendation List</b><br/>Ranked items with explanations"]
+    PERS --> OUT
+
+    %% ── Styles ──────────────────────────────────────
+    classDef inputBox fill:#AED6F1,stroke:#5DADE2,stroke-width:2px,color:#2C3E50
+    classDef outputBox fill:#A9DFBF,stroke:#27AE60,stroke-width:2px,color:#2C3E50
+    classDef agentBox fill:#EBF0F5,stroke:#5B7BA0,stroke-width:1.5px,color:#2C3E50
+    classDef pipeCS fill:#D6EAF8,stroke:#5DADE2,stroke-width:1px
+    classDef pipeAS fill:#D5F5E3,stroke:#27AE60,stroke-width:1px
+    classDef pipeCT fill:#FDEBD0,stroke:#E67E22,stroke-width:1px
+    classDef recBox fill:#E8DAEF,stroke:#8E44AD,stroke-width:1.5px,color:#2C3E50
+
+    class DS,PP,SP inputBox
+    class OUT outputBox
+    class DIAG,CONF,KG,PRED,PERS agentBox
+    class REC recBox
+    class P1 pipeCS
+    class P2 pipeAS
+    class P3 pipeCT
