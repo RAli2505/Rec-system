@@ -24,6 +24,9 @@ from agents.base_agent import BaseAgent
 t0 = time.time()
 loader = EdNetLoader(data_dir="data/raw")
 interactions = loader.load_interactions(sample_users=300)
+# Add confidence_class if missing (required by PredictionAgent)
+if "confidence_class" not in interactions.columns:
+    interactions["confidence_class"] = 0
 print(f"Data loaded in {time.time()-t0:.1f}s")
 print(f"  Interactions: {len(interactions):,}, Users: {interactions['user_id'].nunique()}")
 
@@ -33,11 +36,11 @@ print("=" * 60)
 print("TEST 1: Constants and dimensions")
 print("=" * 60)
 assert NUM_TAGS == 293
-assert SEQ_LEN == 50
-assert HORIZON == 10
-assert INPUT_DIM == 51  # 32+1+1+1+8+8
+assert SEQ_LEN == 100
+assert HORIZON == 20
+assert INPUT_DIM == 69
 print(f"  NUM_TAGS={NUM_TAGS}, SEQ_LEN={SEQ_LEN}, HORIZON={HORIZON}")
-print(f"  INPUT_DIM={INPUT_DIM} (tag_emb=32 + 3 scalar + part_emb=8 + conf_emb=8)")
+print(f"  INPUT_DIM={INPUT_DIM}")
 print("  PASS")
 
 # ═══════════════════════════════════════════════════
@@ -46,20 +49,19 @@ print("=" * 60)
 print("TEST 2: GapPredictionLSTM forward pass")
 print("=" * 60)
 model = GapPredictionLSTM().to(DEVICE)
-batch = torch.randn(4, SEQ_LEN, 6).to(DEVICE)
+batch = torch.randn(4, SEQ_LEN, 14).to(DEVICE)
 # Fix integer columns to valid ranges
-batch[:, :, 0] = torch.randint(0, NUM_TAGS, (4, SEQ_LEN)).float()
-batch[:, :, 4] = torch.randint(0, 7, (4, SEQ_LEN)).float()
-batch[:, :, 5] = torch.randint(0, 6, (4, SEQ_LEN)).float()
+batch[:, :, :7] = torch.randint(0, NUM_TAGS, (4, SEQ_LEN, 7)).float()
+batch[:, :, 10] = torch.randint(0, 7, (4, SEQ_LEN)).float()
+batch[:, :, 11] = torch.randint(0, 6, (4, SEQ_LEN)).float()
 
 with torch.no_grad():
     out = model(batch)
 
 assert out.shape == (4, NUM_TAGS), f"Expected (4, {NUM_TAGS}), got {out.shape}"
-assert (out >= 0).all() and (out <= 1).all(), "Output must be in [0, 1]"
 print(f"  Input shape: {batch.shape}")
 print(f"  Output shape: {out.shape}")
-print(f"  Output range: [{out.min():.4f}, {out.max():.4f}]")
+print(f"  Logit range: [{out.min():.4f}, {out.max():.4f}]")
 print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 print("  PASS")
 
@@ -76,7 +78,7 @@ print(f"  Sequences: {len(dataset)}")
 
 if len(dataset) > 0:
     x, y = dataset[0]
-    assert x.shape == (SEQ_LEN, 6), f"Expected ({SEQ_LEN}, 6), got {x.shape}"
+    assert x.shape == (SEQ_LEN, 14), f"Expected ({SEQ_LEN}, 14), got {x.shape}"
     assert y.shape == (NUM_TAGS,), f"Expected ({NUM_TAGS},), got {y.shape}"
     assert y.dtype == torch.float32
     assert (y >= 0).all() and (y <= 1).all()

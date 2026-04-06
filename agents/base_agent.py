@@ -52,13 +52,27 @@ class BaseAgent(ABC):
         self.orchestrator: Orchestrator | None = None
         self.status: str = "idle"
         self._message_log: list[Message] = []
+        self._full_config = self._load_full_config(config_path)
         self._config = self._load_config(config_path)
+
+    def _load_full_config(self, path: str) -> dict:
+        """Load the full YAML config."""
+        from .utils import load_config
+        return load_config(path)
 
     def _load_config(self, path: str) -> dict:
         """Load agent-specific config section."""
-        from .utils import load_config
-        full = load_config(path)
-        return full.get(self.name, {})
+        return self._full_config.get(self.name, {})
+
+    @property
+    def global_config(self) -> dict[str, Any]:
+        """Return the global config section for cross-agent settings."""
+        return self._full_config.get("global", {})
+
+    @property
+    def global_seed(self) -> int:
+        """Resolve the run seed from global config, defaulting to 42."""
+        return int(self.global_config.get("seed", 42))
 
     # ------------------------------------------------------------------
     # Lifecycle

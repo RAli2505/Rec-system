@@ -207,7 +207,7 @@ class Orchestrator:
         5. RecommendationAgent — generate next recommendations
         6. PersonalizationAgent — refine cluster / personalise
         """
-        logger.info(
+        logger.debug(
             "=== ASSESSMENT pipeline for user %s (%d interactions) ===",
             user_id, len(interactions),
         )
@@ -254,37 +254,48 @@ class Orchestrator:
         prediction._set_processing()
         pred_result = prediction.predict_gaps(  # type: ignore[attr-defined]
             user_id=user_id,
+            recent=interactions,
             diagnostic=diag_result,
             kg_profile=kg_result,
         )
         prediction._set_idle()
         result["predictions"] = pred_result
 
-        # Step 5: Recommendations (Thompson Sampling + LambdaMART)
-        rec = self.get_agent(RECOMMENDATION)
-        rec._set_processing()
-        rec_result = rec.recommend(  # type: ignore[attr-defined]
-            user_id=user_id,
-            kg_profile=kg_result,
-            confidence=conf_result,
-            predictions=pred_result,
-        )
-        rec._set_idle()
-        result["recommendations"] = rec_result
-
-        # Step 6: Personalisation
+        # Step 5: Personalisation (moved BEFORE recommendations)
         pers = self.get_agent(PERSONALIZATION)
         pers._set_processing()
         pers_result = pers.personalize(  # type: ignore[attr-defined]
             user_id=user_id,
             diagnostic=diag_result,
             confidence=conf_result,
-            recommendations=rec_result,
+            recommendations=None,
         )
         pers._set_idle()
         result["personalization"] = pers_result
 
-        logger.info("=== ASSESSMENT pipeline complete ===")
+        # Step 6: Refresh recommendation-side user profile before ranking
+        rec = self.get_agent(RECOMMENDATION)
+        updater = getattr(rec, "update_user_profile", None)
+        if callable(updater):
+            updater(
+                user_id=user_id,
+                interactions=interactions,
+                confidence_result=conf_result,
+            )
+
+        # Step 7: Recommendations (informed by learner level)
+        rec._set_processing()
+        rec_result = rec.recommend(  # type: ignore[attr-defined]
+            user_id=user_id,
+            kg_profile=kg_result,
+            confidence=conf_result,
+            predictions=pred_result,
+            learner_level=pers_result.get("level") if isinstance(pers_result, dict) else None,
+        )
+        rec._set_idle()
+        result["recommendations"] = rec_result
+
+        logger.debug("=== ASSESSMENT pipeline complete ===")
         return result
 
     # ------------------------------------------------------------------
@@ -404,10 +415,59 @@ class Orchestrator:
 
         all_preds: list[dict] = []
         all_recs: list[dict] = []
-        user_ids = test_df["user_id"].unique()
+        learning_gains: list[float] = []
+        learning_gains_adj: list[float] = []  # difficulty-adjusted
+
+        # Precompute per-question global accuracy for difficulty adjustment
+        _q_acc = test_df.groupby("question_id")["correct"].mean()
+        _q_difficulty: dict[str, float] = {str(q): float(a) for q, a in _q_acc.items()}
+
+        # Pre-group by user_id — avoids O(n) scan per user
+        grouped = {
+            uid: grp.sort_values("timestamp")
+            for uid, grp in test_df.groupby("user_id")
+        }
+        user_ids = list(grouped.keys())
+        has_tags = "tags" in test_df.columns
+
+        def _parse_tags_set(series) -> set:
+            """Fast tag extraction from a pandas Series of tag values."""
+            tags: set = set()
+            for t in series.values:
+                if isinstance(t, list):
+                    tags.update(t)
+                elif isinstance(t, str):
+                    tags.update(
+                        int(x) for x in t.replace(";", ",").split(",")
+                        if x.strip().isdigit()
+                    )
+            return tags
+
+        def _build_gt_tag_labels(ground_truth) -> np.ndarray:
+            """Build 293-dim failure vector from ground truth rows."""
+            gt_tag_labels = np.zeros(293, dtype=np.float32)
+            if not has_tags:
+                return gt_tag_labels
+            incorrect = ground_truth[~ground_truth["correct"].astype(bool)]
+            if len(incorrect) == 0:
+                return gt_tag_labels
+            for t in incorrect["tags"].values:
+                if isinstance(t, list):
+                    tag_list = t
+                elif isinstance(t, str):
+                    tag_list = [
+                        int(x) for x in t.replace(";", ",").split(",")
+                        if x.strip().isdigit()
+                    ]
+                else:
+                    continue
+                for tag_id in tag_list:
+                    if 0 <= tag_id < 293:
+                        gt_tag_labels[tag_id] = 1.0
+            return gt_tag_labels
 
         for i, uid in enumerate(user_ids):
-            user_df = test_df[test_df["user_id"] == uid].sort_values("timestamp")
+            user_df = grouped[uid]
 
             # Use first context_ratio of user's test interactions as "context"
             split_idx = max(1, int(len(user_df) * context_ratio))
@@ -424,33 +484,75 @@ class Orchestrator:
                     tags=None,
                 )
 
-                # Collect predictions
+                # Collect predictions (LSTM gap format)
                 if "predictions" in result and result["predictions"]:
                     all_preds.append({
                         "user_id": uid,
                         "predicted": result["predictions"],
                         "ground_truth": ground_truth,
+                        "gt_tag_labels": _build_gt_tag_labels(ground_truth),
                     })
 
                 # Collect recommendations
                 if "recommendations" in result and result["recommendations"]:
+                    gt_tags = _parse_tags_set(ground_truth["tags"]) if has_tags else set()
                     all_recs.append({
                         "user_id": uid,
                         "recommended": result["recommendations"],
-                        "ground_truth_items": ground_truth["question_id"].tolist(),
+                        "ground_truth_items": [str(x) for x in ground_truth["question_id"].values],
+                        "ground_truth_tags": list(gt_tags),
                     })
+
+                # learning_gain: accuracy improvement from context to ground truth
+                pre_acc = float(context["correct"].mean())
+                post_acc = float(ground_truth["correct"].mean())
+                learning_gains.append(post_acc - pre_acc)
+
+                # Difficulty-adjusted learning gain:
+                # gain = (post_acc - E[post]) - (pre_acc - E[pre])
+                # where E[x] = mean global accuracy of questions in that split.
+                # This removes the confound from harder questions in ground truth.
+                pre_expected = float(context["question_id"].map(
+                    lambda q: _q_difficulty.get(str(q), 0.5)
+                ).mean())
+                post_expected = float(ground_truth["question_id"].map(
+                    lambda q: _q_difficulty.get(str(q), 0.5)
+                ).mean())
+                adj_gain = (post_acc - post_expected) - (pre_acc - pre_expected)
+                learning_gains_adj.append(adj_gain)
 
             except Exception as e:
                 logger.warning("Error evaluating user %s: %s", uid, e)
 
-            if (i + 1) % 100 == 0:
-                logger.info("Evaluated %d / %d users", i + 1, len(user_ids))
+            if (i + 1) % 500 == 0:
+                elapsed_so_far = time.time() - t0
+                rate = (i + 1) / elapsed_so_far
+                eta = (len(user_ids) - i - 1) / rate
+                logger.info(
+                    "Evaluated %d / %d users (%.1f u/s, ETA %.0fs)",
+                    i + 1, len(user_ids), rate, eta,
+                )
 
         # Compute metrics
         metrics = self._compute_metrics(all_preds, all_recs, top_k, test_df)
         elapsed = time.time() - t0
         metrics["eval_time_sec"] = round(elapsed, 1)
         metrics["n_users_evaluated"] = len(all_preds)
+
+        # Learning gain: average accuracy improvement
+        if learning_gains:
+            metrics["learning_gain_raw"] = round(float(np.mean(learning_gains)), 4)
+            metrics["learning_gain_raw_std"] = round(float(np.std(learning_gains)), 4)
+        # Difficulty-adjusted learning gain (primary metric for the paper)
+        if learning_gains_adj:
+            metrics["learning_gain"] = round(float(np.mean(learning_gains_adj)), 4)
+            metrics["learning_gain_std"] = round(float(np.std(learning_gains_adj)), 4)
+            # Trimmed mean (remove top/bottom 5% outliers for robustness)
+            arr = np.array(learning_gains_adj)
+            lo, hi = np.percentile(arr, [5, 95])
+            trimmed = arr[(arr >= lo) & (arr <= hi)]
+            if len(trimmed) > 0:
+                metrics["learning_gain_trimmed"] = round(float(trimmed.mean()), 4)
 
         logger.info("=== BATCH EVALUATION complete in %.1fs ===", elapsed)
         for k, v in sorted(metrics.items()):
@@ -472,84 +574,220 @@ class Orchestrator:
         """Aggregate predictions and recommendations into standard metrics."""
         metrics: dict[str, float] = {}
 
-        # --- Prediction metrics (if agents return correctness predictions) ---
+        # --- LSTM gap prediction metrics (293-dim multilabel) ---
         if all_preds:
-            y_true_list = []
-            y_pred_list = []
+            from sklearn.metrics import f1_score, roc_auc_score
+
+            gap_probs_list = []   # (N, 293)
+            gap_labels_list = []  # (N, 293)
+
             for entry in all_preds:
                 preds = entry["predicted"]
-                gt = entry["ground_truth"]
-                if isinstance(preds, dict) and "correct_prob" in preds:
-                    probs = preds["correct_prob"]
-                    truths = gt["correct"].astype(int).tolist()
-                    # Align lengths: predictions may cover fewer items than ground truth
-                    n = min(len(probs), len(truths))
-                    if n > 0:
-                        y_pred_list.extend(probs[:n])
-                        y_true_list.extend(truths[:n])
+                gt_labels = entry.get("gt_tag_labels")
 
-            if y_true_list and y_pred_list:
-                from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+                # LSTM format: gap_probabilities is a 293-dim list
+                if isinstance(preds, dict) and "gap_probabilities" in preds:
+                    probs = preds["gap_probabilities"]
+                    if isinstance(probs, list) and len(probs) == 293 and gt_labels is not None:
+                        gap_probs_list.append(probs)
+                        gap_labels_list.append(gt_labels)
 
-                y_true = np.array(y_true_list)
-                y_score = np.array(y_pred_list)
-                y_pred_bin = (y_score >= 0.5).astype(int)
+            if gap_probs_list:
+                y_score = np.array(gap_probs_list)   # (N, 293)
+                y_true  = np.array(gap_labels_list)  # (N, 293)
 
-                metrics["accuracy"] = round(float(accuracy_score(y_true, y_pred_bin)), 4)
-                metrics["f1"] = round(float(f1_score(y_true, y_pred_bin, zero_division=0)), 4)
-                try:
-                    metrics["auc"] = round(float(roc_auc_score(y_true, y_score)), 4)
-                except ValueError:
-                    metrics["auc"] = 0.0
+                # Find optimal threshold — fine-grained scan [0.005 .. 0.5]
+                best_f1, best_thresh = 0.0, 0.5
+                for t in np.concatenate([
+                    np.arange(0.005, 0.05, 0.005),
+                    np.arange(0.05, 0.15, 0.01),
+                    np.arange(0.15, 0.51, 0.05),
+                ]):
+                    y_bin = (y_score >= t).astype(int)
+                    f1 = f1_score(y_true, y_bin, average="micro", zero_division=0)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_thresh = float(t)
 
-        # --- Recommendation metrics ---
+                y_pred_bin = (y_score >= best_thresh).astype(int)
+
+                metrics["lstm_f1_micro"]  = round(float(best_f1), 4)
+                metrics["lstm_threshold"] = round(best_thresh, 4)
+                metrics["lstm_f1_macro"]  = round(
+                    float(f1_score(y_true, y_pred_bin, average="macro", zero_division=0)), 4
+                )
+
+                # AUC: require >=5 positive samples per tag for robust estimate
+                tag_pos_counts = y_true.sum(axis=0)
+                tag_mask = tag_pos_counts >= 5
+                # Also need at least one negative per tag
+                tag_neg_counts = (1 - y_true).sum(axis=0)
+                tag_mask = tag_mask & (tag_neg_counts >= 5)
+                if tag_mask.sum() > 1:
+                    try:
+                        metrics["lstm_auc"] = round(
+                            float(roc_auc_score(
+                                y_true[:, tag_mask],
+                                y_score[:, tag_mask],
+                                average="macro",
+                            )), 4
+                        )
+                        metrics["lstm_auc_weighted"] = round(
+                            float(roc_auc_score(
+                                y_true[:, tag_mask],
+                                y_score[:, tag_mask],
+                                average="weighted",
+                            )), 4
+                        )
+                    except ValueError:
+                        pass
+
+                logger.info(
+                    "LSTM gap F1: micro=%.4f macro=%.4f threshold=%.2f (N=%d users)",
+                    best_f1, metrics.get("lstm_f1_macro", 0), best_thresh, len(gap_probs_list),
+                )
+
+        # --- Recommendation metrics (tag-based relevance) ---
         if all_recs:
             precisions = []
             recalls = []
             ndcgs = []
+            mrrs = []
             all_recommended_items: set = set()
+            all_recommended_tags: set = set()
+
+            # Normalize IDs: strip 'q' prefix, lowercase, strip whitespace
+            def _norm_id(x) -> str:
+                s = str(x).strip().lower()
+                return s[1:] if s.startswith("q") and s[1:].isdigit() else s
 
             for entry in all_recs:
-                rec_items = entry["recommended"]
-                if isinstance(rec_items, dict):
-                    rec_items = rec_items.get("items", [])
-                if isinstance(rec_items, list) and len(rec_items) > 0:
-                    # Extract question_ids if items are dicts
-                    if isinstance(rec_items[0], dict):
-                        rec_items = [r.get("question_id", r) for r in rec_items]
+                rec_items_raw = entry["recommended"]
+                if isinstance(rec_items_raw, dict):
+                    rec_items_raw = rec_items_raw.get("items", [])
 
-                rec_items = rec_items[:top_k]
-                gt_items = set(entry["ground_truth_items"])
-                all_recommended_items.update(rec_items)
+                # Extract item_ids and their tags (ensure int types for tag comparison)
+                rec_item_ids = []
+                rec_item_tags: list[set] = []
+                if isinstance(rec_items_raw, list):
+                    for r in rec_items_raw:
+                        if isinstance(r, dict):
+                            rec_item_ids.append(_norm_id(r.get("item_id", r.get("question_id", ""))))
+                            raw_tags = r.get("related_tags", [])
+                            tags = set()
+                            for t in raw_tags:
+                                try:
+                                    tags.add(int(t))
+                                except (ValueError, TypeError):
+                                    pass
+                            rec_item_tags.append(tags)
+                            all_recommended_tags.update(tags)
+                        else:
+                            rec_item_ids.append(_norm_id(r))
+                            rec_item_tags.append(set())
+
+                rec_item_ids = rec_item_ids[:top_k]
+                rec_item_tags = rec_item_tags[:top_k]
+
+                gt_items = set(_norm_id(x) for x in entry["ground_truth_items"])
+                gt_tags_raw = entry.get("ground_truth_tags", [])
+                gt_tags = set()
+                for t in gt_tags_raw:
+                    try:
+                        gt_tags.add(int(t))
+                    except (ValueError, TypeError):
+                        pass
+                all_recommended_items.update(rec_item_ids)
+
+                # Relevance: item is a hit if its item_id matches OR its tags
+                # overlap with ground truth tags
+                def _is_relevant(idx: int) -> bool:
+                    if rec_item_ids[idx] in gt_items:
+                        return True
+                    if gt_tags and rec_item_tags[idx]:
+                        return bool(rec_item_tags[idx] & gt_tags)
+                    return False
+
+                n_relevant = sum(1 for i in range(len(rec_item_ids)) if _is_relevant(i))
 
                 # Precision@K
-                hits = len(set(rec_items) & gt_items)
-                precisions.append(hits / top_k if top_k > 0 else 0.0)
+                precisions.append(n_relevant / top_k if top_k > 0 else 0.0)
 
-                # Recall@K
-                recalls.append(hits / len(gt_items) if gt_items else 0.0)
+                # Recall@K — count ground truth tags covered
+                if gt_tags:
+                    covered = set()
+                    for tags in rec_item_tags:
+                        covered.update(tags & gt_tags)
+                    recalls.append(len(covered) / len(gt_tags))
+                else:
+                    recalls.append(n_relevant / len(gt_items) if gt_items else 0.0)
 
                 # NDCG@K
                 dcg = sum(
                     1.0 / np.log2(rank + 2)
-                    for rank, item in enumerate(rec_items)
-                    if item in gt_items
+                    for rank in range(len(rec_item_ids))
+                    if _is_relevant(rank)
                 )
+                n_total_relevant = max(n_relevant, len(gt_tags) if gt_tags else len(gt_items))
                 ideal = sum(
                     1.0 / np.log2(rank + 2)
-                    for rank in range(min(len(gt_items), top_k))
+                    for rank in range(min(n_total_relevant, top_k))
                 )
                 ndcgs.append(dcg / ideal if ideal > 0 else 0.0)
+
+                # MRR
+                rr = 0.0
+                for rank in range(len(rec_item_ids)):
+                    if _is_relevant(rank):
+                        rr = 1.0 / (rank + 1)
+                        break
+                mrrs.append(rr)
 
             metrics[f"precision@{top_k}"] = round(float(np.mean(precisions)), 4)
             metrics[f"recall@{top_k}"] = round(float(np.mean(recalls)), 4)
             metrics[f"ndcg@{top_k}"] = round(float(np.mean(ndcgs)), 4)
+            metrics["mrr"] = round(float(np.mean(mrrs)), 4)
 
-            # Coverage: fraction of catalogue recommended at least once
-            all_items = set(full_df["question_id"].unique())
-            metrics["coverage"] = round(
-                len(all_recommended_items & all_items) / len(all_items), 4
-            ) if all_items else 0.0
+            # Tag coverage (primary): fraction of all tags recommended
+            # This is the meaningful coverage metric for educational RS —
+            # recommendations target tags/skills, not specific questions.
+            all_tags_in_data = set()
+            if "tags" in full_df.columns:
+                for t in full_df["tags"]:
+                    if isinstance(t, list):
+                        all_tags_in_data.update(int(x) for x in t)
+                    elif isinstance(t, (str, np.str_)):
+                        all_tags_in_data.update(
+                            int(x.strip()) for x in str(t).replace(";", ",").split(",") if x.strip().isdigit()
+                        )
+                    elif isinstance(t, (int, float, np.integer, np.floating)) and not np.isnan(t):
+                        all_tags_in_data.add(int(t))
+            # Ensure recommended tags are also ints for consistent comparison
+            all_recommended_tags_int = set()
+            for tag in all_recommended_tags:
+                try:
+                    all_recommended_tags_int.add(int(tag))
+                except (ValueError, TypeError):
+                    pass
+            if all_tags_in_data:
+                tag_cov = round(
+                    len(all_recommended_tags_int & all_tags_in_data) / len(all_tags_in_data), 4
+                )
+            else:
+                tag_cov = 0.0
+            metrics["coverage"] = tag_cov
+            metrics["tag_coverage"] = tag_cov
+
+            # Question-level coverage
+            all_questions = set(_norm_id(x) for x in full_df["question_id"].unique())
+            question_recs = set()
+            for iid in all_recommended_items:
+                nid = _norm_id(iid)
+                if not nid.startswith("tag_") and not nid.startswith("l_") and not nid.startswith("l"):
+                    question_recs.add(nid)
+            metrics["question_coverage"] = round(
+                len(question_recs & all_questions) / len(all_questions), 4
+            ) if all_questions else 0.0
 
         return metrics
 

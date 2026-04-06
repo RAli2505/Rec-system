@@ -29,8 +29,12 @@ import pandas as pd
 from scipy.optimize import minimize_scalar
 from scipy.special import expit  # sigmoid
 from scipy.stats import pointbiserialr
+import torch
 
 from .base_agent import BaseAgent
+
+# GPU device selection
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 logger = logging.getLogger("mars.agent.diagnostic")
 
@@ -209,6 +213,11 @@ class DiagnosticAgent(BaseAgent):
         # ── Guessing (c): fixed default ──
         c = np.full(n_items, self._guessing_c, dtype=np.float64)
 
+        # ── EM refinement: 200 iterations of joint MLE ──
+        # Alternating between theta estimates (E-step) and item param updates (M-step)
+        # Uses 21-point Gauss-Hermite quadrature over theta ~ N(0,1)
+        a, b = self._em_calibrate(R, a, b, c, max_iter=200)
+
         params = IRTParams(
             question_ids=question_ids,
             a=a, b=b, c=c,
@@ -227,10 +236,133 @@ class DiagnosticAgent(BaseAgent):
         )
 
         logger.info(
-            "IRT calibrated: b=[%.2f, %.2f], a=[%.2f, %.2f], c=%.2f",
+            "IRT calibrated (EM): b=[%.2f, %.2f], a=[%.2f, %.2f], c=%.2f",
             b.min(), b.max(), a.min(), a.max(), c.mean(),
         )
         return params
+
+    @staticmethod
+    def _em_calibrate(
+        R: np.ndarray,
+        a_init: np.ndarray,
+        b_init: np.ndarray,
+        c: np.ndarray,
+        max_iter: int = 200,
+        tol: float = 1e-4,
+        n_quad: int = 21,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        EM calibration for IRT 3PL using Gauss-Hermite quadrature.
+        Fully vectorised, runs on GPU (CUDA) if available.
+
+        E-step: compute posterior P(θ | responses) over quadrature points.
+        M-step: update a, b via Newton-Raphson (vectorised over all items).
+
+        Parameters
+        ----------
+        R        : (n_students, n_items) response matrix (NaN = unseen)
+        a_init   : initial discrimination values (n_items,)
+        b_init   : initial difficulty values (n_items,)
+        c        : guessing parameters, fixed (n_items,)
+        max_iter : max EM iterations
+        tol      : convergence threshold (max change in b)
+        n_quad   : number of quadrature points
+
+        Returns
+        -------
+        (a, b) refined parameter arrays (NumPy, CPU)
+        """
+        device = _DEVICE
+        logger.info("IRT EM using device: %s", device)
+
+        # Gauss-Hermite quadrature points and weights on N(0,1)
+        from numpy.polynomial.hermite import hermgauss
+        pts, wts = hermgauss(n_quad)
+        theta_q_np = pts * np.sqrt(2)        # (n_quad,)
+        wts_q_np   = wts / np.sqrt(np.pi)   # (n_quad,)
+
+        # Move everything to GPU tensors (float32 for speed)
+        def _t(x):
+            return torch.tensor(x, dtype=torch.float32, device=device)
+
+        # Replace NaN with 0 and build mask
+        obs_mask_np = ~np.isnan(R)
+        R_obs_np    = np.where(obs_mask_np, R, 0.0)
+
+        # Tensors
+        obs_mask = _t(obs_mask_np.astype(np.float32))  # (n_s, n_items)
+        R_obs    = _t(R_obs_np.astype(np.float32))     # (n_s, n_items)
+        theta_q  = _t(theta_q_np.astype(np.float32))  # (n_quad,)
+        log_wts  = _t(np.log(wts_q_np).astype(np.float32))  # (n_quad,)
+
+        a = _t(a_init.astype(np.float32))  # (n_items,)
+        b = _t(b_init.astype(np.float32))  # (n_items,)
+        c_t = _t(c.astype(np.float32))     # (n_items,)
+
+        n_students, n_items = R.shape
+
+        for iteration in range(max_iter):
+            b_old = b.clone()
+
+            # ── E-step ──────────────────────────────────────────────────
+            # z: (n_items, n_quad)  =  a_j * (θ_q - b_j)
+            z = a.unsqueeze(1) * (theta_q.unsqueeze(0) - b.unsqueeze(1))
+            # P: (n_items, n_quad)
+            P = c_t.unsqueeze(1) + (1 - c_t.unsqueeze(1)) / (1 + torch.exp(-z))
+            P = P.clamp(1e-7, 1 - 1e-7)
+
+            log_P  = torch.log(P)      # (n_items, n_quad)
+            log_1P = torch.log(1 - P)  # (n_items, n_quad)
+
+            # L[s, q] = Σ_j obs[s,j] * (R[s,j]*logP[j,q] + (1-R[s,j])*log1P[j,q])
+            # log_P: (n_items, n_quad), R_obs: (n_s, n_items)
+            # (n_s, n_items) @ (n_items, n_quad) → (n_s, n_quad)
+            L = R_obs @ log_P + (obs_mask - R_obs) @ log_1P  # (n_s, n_quad)
+
+            # Posterior: w[s,q] ∝ exp(L[s,q]) * wts_q[q]
+            log_post = L + log_wts.unsqueeze(0)          # (n_s, n_quad)
+            log_post = log_post - log_post.max(dim=1, keepdim=True).values
+            post = torch.exp(log_post)
+            post = post / post.sum(dim=1, keepdim=True)  # (n_s, n_quad)
+
+            # ── M-step (fully vectorised Newton-Raphson) ─────────────────
+            # Expected total & correct per item per quad point
+            # f_qj[j, q] = Σ_s post[s,q] * obs[s,j]
+            # r_qj[j, q] = Σ_s post[s,q] * R[s,j]
+            f_qj = obs_mask.T @ post   # (n_items, n_quad)
+            r_qj = R_obs.T @ post      # (n_items, n_quad)
+
+            # Vectorised Newton step for all items simultaneously
+            # z_j: (n_items, n_quad)
+            z_j = a.unsqueeze(1) * (theta_q.unsqueeze(0) - b.unsqueeze(1))
+            P_j = c_t.unsqueeze(1) + (1 - c_t.unsqueeze(1)) / (1 + torch.exp(-z_j))
+            P_j = P_j.clamp(1e-7, 1 - 1e-7)
+
+            residual = (P_j * f_qj - r_qj).sum(dim=1)   # (n_items,)
+            W_j = (a ** 2).unsqueeze(1) * \
+                  ((P_j - c_t.unsqueeze(1)) ** 2) / \
+                  ((1 - c_t.unsqueeze(1)) ** 2) * \
+                  (1 - P_j) / P_j                        # (n_items, n_quad)
+            denom = (W_j * f_qj).sum(dim=1)              # (n_items,)
+
+            # Only update items with enough data
+            valid = f_qj.sum(dim=1) >= 1.0               # (n_items,)
+            step  = torch.where(
+                valid & (denom.abs() > 1e-10),
+                residual / denom.clamp(min=1e-10),
+                torch.zeros_like(b),
+            )
+            b = (b + step).clamp(-3.0, 3.0)
+
+            # ── Convergence check ────────────────────────────────────────
+            delta = (b - b_old).abs().max().item()
+            if iteration % 20 == 0:
+                logger.info("IRT EM iter %d/%d  max_Δb=%.6f", iteration + 1, max_iter, delta)
+            if delta < tol:
+                logger.info("IRT EM converged at iter %d (Δb=%.6f < tol=%.6f)", iteration + 1, delta, tol)
+                break
+
+        return a.cpu().numpy().astype(np.float64), b.cpu().numpy().astype(np.float64)
 
     def calibrate_from_interactions(
         self,

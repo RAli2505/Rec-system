@@ -1,0 +1,21 @@
+{
+  "lstm_f1_micro": 0.1324,
+  "lstm_threshold": 0.5,
+  "lstm_f1_macro": 0.1007,
+  "lstm_auc": 0.7054,
+  "lstm_auc_weighted": 0.6801,
+  "precision@10": 0.3552,
+  "recall@10": 0.122,
+  "ndcg@10": 0.3978,
+  "mrr": 0.4396,
+  "coverage": 0.3369,
+  "tag_coverage": 0.3369,
+  "question_coverage": 0.0077,
+  "eval_time_sec": 3433.4,
+  "n_users_evaluated": 14577,
+  "learning_gain_raw": -0.017,
+  "learning_gain_raw_std": 0.467,
+  "learning_gain": -0.0123,
+  "learning_gain_std": 0.4348,
+  "learning_gain_trimmed": -0.0136
+}

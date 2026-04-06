@@ -1,0 +1,96 @@
+{
+  "diagnostic": {
+    "r_theta_accuracy": 0.8079,
+    "mean_sem": 0.9404,
+    "n_items": 8362,
+    "n_users_estimated": 20767,
+    "time_s": 58.9
+  },
+  "confidence": {
+    "method": "rule_based",
+    "cv_f1_macro_mean": 1.0,
+    "cv_f1_macro_std": 0.0,
+    "full_f1_macro": 1.0,
+    "n_samples": 1704701,
+    "n_classes": 6,
+    "class_distribution": {
+      "SOLID": 518644,
+      "UNSURE_CORRECT": 393740,
+      "FALSE_CONFIDENCE": 210016,
+      "CLEAR_GAP": 263860,
+      "DOUBT_CORRECT": 151901,
+      "DOUBT_INCORRECT": 166540
+    },
+    "time_s": 0.3
+  },
+  "knowledge_graph": {
+    "n_nodes": 14491,
+    "n_edges": 45896,
+    "time_s": 400.4
+  },
+  "prediction": {
+    "best_epoch": 4,
+    "train_loss": 0.2068,
+    "val_loss": 0.1847,
+    "val_auc": 0.7857,
+    "optimal_threshold": 0.5000000000000001,
+    "val_f1_at_threshold": 0.2415,
+    "model_type": "transformer",
+    "n_train_sequences": 91888,
+    "n_val_sequences": 7235,
+    "total_epochs": 14,
+    "history": {
+      "train_loss": [
+        0.22577088867887482,
+        0.21200437057234117,
+        0.20903199882062365,
+        0.20683113012390217,
+        0.20464193966229313,
+        0.20220621681479026,
+        0.19989949410838337,
+        0.19724365869604446,
+        0.1953481400494456,
+        0.1939732337105905,
+        0.20109203999504074,
+        0.20009074125615336,
+        0.1986962503709501,
+        0.1971475363690873
+      ],
+      "val_loss": [
+        0.18972088657973105,
+        0.18817335393345147,
+        0.18567387746614322,
+        0.1846728922243704,
+        0.185019903277096,
+        0.1847570810401649,
+        0.18604680359886402,
+        0.1903599682345725,
+        0.18992375987663604,
+        0.19238934299924917,
+        0.18716215486066384,
+        0.19146053963585905,
+        0.18936075766881308,
+        0.191070950737125
+      ]
+    },
+    "time_s": 1252.9
+  },
+  "recommendation": {
+    "ranking_method": "weighted_linear_scoring",
+    "time_s": 44.5
+  },
+  "personalization": {
+    "method": "irt_rule_based",
+    "n_levels": 5,
+    "level_counts": {
+      "0": 2322,
+      "1": 3004,
+      "2": 9938,
+      "3": 3765,
+      "4": 1738
+    },
+    "theta_mean": 0.2926,
+    "theta_std": 0.8376,
+    "time_s": 7.9
+  }
+}

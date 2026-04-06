@@ -9,7 +9,7 @@ global:
 
 # ── Data Pipeline ──
 data:
-  sample_users: 10000        # loader.py: EdNetLoader.load_interactions()
+  sample_users: 50000        # loader.py: EdNetLoader.load_interactions()
   stratified_sampling: true  # loader.py: quintile-based representative sampling
   min_answers_per_user: 10   # preprocessor.py: MIN_ANSWERS_PER_USER
   elapsed_min_ms: 1000       # preprocessor.py: ELAPSED_MIN_MS
@@ -63,7 +63,7 @@ knowledge_graph:
   graphsage:
     hidden_dim: 128
     output_dim: 64
-    epochs: 200
+    epochs: 500
     learning_rate: 0.01
     train_split: 0.8          # For link prediction train/test
   prerequisites:
@@ -75,18 +75,18 @@ knowledge_graph:
 
 # ── PredictionAgent ──
 prediction:
-  model: "lstm"               # "lstm", "gru", "transformer"
-  seq_len: 50
-  horizon: 10
+  model: "transformer"        # "lstm", "gru", "transformer"
+  seq_len: 100
+  horizon: 20
   num_tags: 293
   lstm:
-    hidden_dim: 128
+    hidden_dim: 256
     num_layers: 2
-    dropout: 0.3
-    learning_rate: 0.001
-    batch_size: 512
+    dropout: 0.25
+    learning_rate: 0.0005
+    batch_size: 256
     epochs: 50
-    patience: 5
+    patience: 8
   gru:
     hidden_dim: 128
     num_layers: 2
@@ -94,17 +94,17 @@ prediction:
     learning_rate: 0.001
     batch_size: 512
     epochs: 50
-    patience: 5
+    patience: 8
   transformer:
-    d_model: 128
+    d_model: 256
     nhead: 8
-    num_layers: 2
-    dim_feedforward: 256
+    num_layers: 4
+    dim_feedforward: 512
     dropout: 0.1
-    learning_rate: 0.0005     # Transformers need lower LR
-    batch_size: 512
-    epochs: 50
-    patience: 5
+    learning_rate: 0.0003     # Lower LR for deeper transformer
+    batch_size: 128           # Smaller batch for larger model
+    epochs: 60
+    patience: 10
   embeddings:
     tag_dim: 32
     part_dim: 8
@@ -115,9 +115,9 @@ prediction:
 recommendation:
   thompson_sampling:
     priors:
-      knowledge_based: {alpha: 10, beta: 1}
-      content_based: {alpha: 5, beta: 1}
-      collaborative: {alpha: 1, beta: 1}
+      knowledge_based: {alpha: 2, beta: 1}
+      content_based: {alpha: 2, beta: 1}
+      collaborative: {alpha: 2, beta: 1}
   cf_min_interactions: 20
   als:
     n_factors: 64
@@ -129,6 +129,14 @@ recommendation:
     learning_rate: 0.1
     n_estimators: 100
   top_k: [5, 10, 20]
+  # ── Ablation switches ──
+  ablation:
+    use_prediction_boost: true    # Inject PredictionAgent gap probabilities into candidate scores
+    prediction_boost_weight: 0.25 # Weight for prediction signal (0 = disabled)
+    use_mmr: true                 # Apply MMR diversification after ranking
+    mmr_lambda: 0.80              # λ for MMR (1.0 = pure relevance, 0.0 = pure diversity)
+    use_zpd_bonus: true           # Apply ZPD soft scoring bonus
+    use_learner_level: true       # Apply learner-level item type preference
 
 # ── PersonalizationAgent ──
 personalization:
@@ -184,4 +192,4 @@ orchestrator:
     continuous:
       rerank_on_confidence_change: true
   evaluation:
-    batch_context_ratio: 0.5  # 50/50 context/evaluation split
+    batch_context_ratio: 0.3  # 30/70 context/evaluation — more items in ground truth

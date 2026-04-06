@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Any
 
 import faiss
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -61,21 +60,6 @@ DEFAULT_STRATEGY_PRIORS = {
     "collaborative":   {"alpha": 1,  "beta": 1},
 }
 
-LAMBDAMART_FEATURES = [
-    "gap_by_tag",
-    "user_accuracy_on_part",
-    "avg_elapsed_time_tag",
-    "changed_answer_rate",
-    "tag_difficulty",
-    "als_score",
-    "lecture_coverage",
-    "kg_score",
-    "cb_score",
-    "cf_score",
-    "false_confidence_count",
-    "prerequisite_completion",
-]
-
 CF_MIN_INTERACTIONS = 20  # minimum answers before enabling collaborative
 
 
@@ -94,9 +78,10 @@ class RecommendationAgent(BaseAgent):
     ) -> None:
         super().__init__()
         # Seed fixing
-        _seed = random_seed if random_seed is not None else self._config.get("seed", 42)
+        _seed = random_seed if random_seed is not None else self.global_seed
         from .utils import set_global_seed
         set_global_seed(_seed)
+        self._seed = _seed
 
         # Bandit strategy: "thompson", "ucb1", "epsilon_greedy", "fixed_kb", "fixed_round_robin"
         self._bandit_strategy = (
@@ -118,11 +103,6 @@ class RecommendationAgent(BaseAgent):
         sbert_cfg = self._config.get("sbert", {})
         self._sbert_model_name = sbert_cfg.get("model_name", "all-MiniLM-L6-v2")
         self._sbert_local_files_only = sbert_cfg.get("local_files_only", True)
-        lm_cfg = self._config.get("lambdamart", {})
-        self._lm_num_leaves = lm_cfg.get("num_leaves", 31)
-        self._lm_min_child = lm_cfg.get("min_child_samples", 10)
-        self._lm_lr = lm_cfg.get("learning_rate", 0.1)
-        self._lm_n_estimators = lm_cfg.get("n_estimators", 100)
         self._n_confidence_classes = int(
             self._config.get("n_confidence_classes", DEFAULT_CONFIDENCE_N_CLASSES)
         )
@@ -150,11 +130,31 @@ class RecommendationAgent(BaseAgent):
         # User profiles (for scoring)
         self._user_profiles: dict[str, dict] = {}
 
-        # LambdaMART ranker
-        self._ranker: lgb.LGBMRanker | None = None
-
         # KG agent reference (set by orchestrator)
         self._kg_agent = None
+
+        # IRT item difficulty map: item_id/tag_id → difficulty (b parameter)
+        self._item_difficulty: dict[str, float] = {}
+
+        # Ablation switches (config-driven)
+        abl = self._config.get("ablation", {})
+        self._use_prediction_boost = abl.get("use_prediction_boost", True)
+        self._prediction_boost_weight = float(abl.get("prediction_boost_weight", 0.25))
+        self._use_mmr = abl.get("use_mmr", True)
+        self._mmr_lambda = float(abl.get("mmr_lambda", 0.80))
+        self._use_zpd_bonus = abl.get("use_zpd_bonus", True)
+        self._use_learner_level = abl.get("use_learner_level", True)
+
+    def set_irt_params(self, item_params: dict[str, float]) -> None:
+        """Set IRT difficulty parameters for ZPD filtering.
+
+        Parameters
+        ----------
+        item_params : dict
+            Mapping of item_id or tag_id → difficulty (IRT b parameter).
+        """
+        self._item_difficulty = {str(k): float(v) for k, v in item_params.items()}
+        logger.info("Set IRT params for %d items", len(self._item_difficulty))
 
     def set_confidence_schema(self, n_classes: int) -> None:
         """Update the active confidence schema for downstream ranking features."""
@@ -254,8 +254,8 @@ class RecommendationAgent(BaseAgent):
         if questions_df is not None:
             q_df = questions_df.copy()
             qpart_col = "part_id" if "part_id" in q_df.columns else "part"
-            # Only add a sample of questions (too many for full index)
-            sample = q_df.sample(min(2000, len(q_df)), random_state=42)
+            # Index more questions for better coverage and item-level matches
+            sample = q_df.sample(min(10000, len(q_df)), random_state=self._seed)
             for _, row in sample.iterrows():
                 qid = str(row["question_id"])
                 pid = int(row[qpart_col])
@@ -393,7 +393,7 @@ class RecommendationAgent(BaseAgent):
             logger.warning("Too few components for SVD — skipping")
             return
 
-        svd = TruncatedSVD(n_components=n_components, random_state=42)
+        svd = TruncatedSVD(n_components=n_components, random_state=self._seed)
         user_factors = svd.fit_transform(mat)  # (n_users, n_factors)
         item_factors = svd.components_.T       # (n_tags, n_factors)
 
@@ -411,6 +411,10 @@ class RecommendationAgent(BaseAgent):
     ) -> list[Rec]:
         """
         Get collaborative filtering recommendations based on similar users.
+
+        Maps top predicted tags to actual items in the content index
+        (questions/lectures) so that recommendations are concrete items
+        rather than abstract tag IDs.
         """
         if self._als_user_factors is None or user_id not in self._als_user_map:
             return []
@@ -420,22 +424,51 @@ class RecommendationAgent(BaseAgent):
 
         # Score all tags
         scores = self._als_item_factors @ user_vec  # (n_tags,)
-        top_indices = np.argsort(scores)[::-1][:n]
+        top_indices = np.argsort(scores)[::-1][:n * 3]  # oversample to find items
 
         results = []
+        seen_items: set = set()
         for idx in top_indices:
             tag_id = self._als_tag_reverse.get(int(idx))
             if tag_id is None:
                 continue
-            results.append(Rec(
-                item_id=f"tag_{tag_id}",
-                item_type="tag",
-                score=float(scores[idx]),
-                strategy="collaborative",
-                related_tags=[tag_id],
-            ))
+            cf_score = float(scores[idx])
 
-        return results
+            # Try to map tag to actual items in the content index
+            mapped = False
+            if self._item_meta:
+                for item_idx, meta in enumerate(self._item_meta):
+                    if tag_id in meta.get("tags", []):
+                        iid = self._item_ids[item_idx]
+                        if iid not in seen_items:
+                            seen_items.add(iid)
+                            results.append(Rec(
+                                item_id=iid,
+                                item_type=meta["item_type"],
+                                score=cf_score,
+                                strategy="collaborative",
+                                related_tags=meta.get("tags", [tag_id]),
+                            ))
+                            mapped = True
+                            if len(results) >= n:
+                                break
+                if len(results) >= n:
+                    break
+
+            # Fallback: emit tag-level rec if no items match
+            if not mapped:
+                results.append(Rec(
+                    item_id=f"tag_{tag_id}",
+                    item_type="tag",
+                    score=cf_score,
+                    strategy="collaborative",
+                    related_tags=[tag_id],
+                ))
+
+            if len(results) >= n:
+                break
+
+        return results[:n]
 
     # ──────────────────────────────────────────────────────
     # 4. Thompson Sampling
@@ -570,104 +603,28 @@ class RecommendationAgent(BaseAgent):
         return weights
 
     # ──────────────────────────────────────────────────────
-    # 5. LambdaMART Re-ranking
+    # 5. Weighted Linear Scoring (interpretable ranking)
     # ──────────────────────────────────────────────────────
+    #
+    # Replaces LambdaMART with a transparent, theory-grounded formula:
+    #   score = w_gap * gap_relevance       (Vygotsky ZPD — target gaps)
+    #         + w_diff * difficulty_match    (item–ability proximity)
+    #         + w_recency * recency_need     (Ebbinghaus spacing effect)
+    #         + w_strategy * strategy_score  (strategy-specific relevance)
+    #
+    # Weights are interpretable and defensible in a dissertation.
 
-    def train_ranker(
-        self,
-        train_features: np.ndarray,
-        train_labels: np.ndarray,
-        train_groups: list[int],
-        val_features: np.ndarray | None = None,
-        val_labels: np.ndarray | None = None,
-        val_groups: list[int] | None = None,
-    ) -> lgb.LGBMRanker:
-        """
-        Train LambdaMART ranker on (user, item) feature pairs.
-
-        12 features per pair as defined in LAMBDAMART_FEATURES.
-        """
-        self._ranker = lgb.LGBMRanker(
-            objective="lambdarank",
-            metric="ndcg",
-            eval_at=[5, 10],
-            n_estimators=500,
-            learning_rate=0.05,
-            num_leaves=31,
-            min_child_samples=10,
-            random_state=42,
-            verbosity=-1,
-        )
-
-        callbacks = [lgb.log_evaluation(period=100)]
-        eval_set = []
-        eval_group = []
-        eval_names = []
-        if val_features is not None and val_labels is not None and val_groups is not None:
-            eval_set = [(val_features, val_labels)]
-            eval_group = [val_groups]
-            eval_names = ["val"]
-            callbacks.append(lgb.early_stopping(stopping_rounds=50, verbose=True))
-
-        self._ranker.fit(
-            train_features, train_labels,
-            group=train_groups,
-            eval_set=eval_set if eval_set else None,
-            eval_group=eval_group if eval_group else None,
-            eval_names=eval_names if eval_names else None,
-            callbacks=callbacks,
-        )
-
-        # Save
-        self._models_dir.mkdir(parents=True, exist_ok=True)
-        self._ranker.booster_.save_model(str(self._models_dir / "lambdamart.txt"))
-        logger.info("LambdaMART ranker trained and saved")
-
-        return self._ranker
-
-    def _build_ranking_features(
-        self,
-        user_id: str,
-        candidates: list[Rec],
-        user_profile: dict | None = None,
-    ) -> np.ndarray:
-        """
-        Build the 12-feature vector for each (user, candidate) pair.
-        """
-        profile = user_profile or self._user_profiles.get(user_id, {})
-        n = len(candidates)
-        feats = np.zeros((n, 12), dtype=np.float32)
-
-        for i, cand in enumerate(candidates):
-            tags = cand.related_tags
-            tag_id = tags[0] if tags else -1
-
-            # 1. gap_by_tag: 1 if tag is in user's gaps
-            feats[i, 0] = 1.0 if tag_id in profile.get("gap_tags", []) else 0.0
-            # 2. user_accuracy_on_part
-            feats[i, 1] = profile.get("part_accuracy", {}).get(str(tag_id), 0.5)
-            # 3. avg_elapsed_time_tag (normalised)
-            feats[i, 2] = profile.get("tag_elapsed", {}).get(str(tag_id), 0.5)
-            # 4. changed_answer_rate
-            feats[i, 3] = profile.get("changed_rate", 0.1)
-            # 5. tag_difficulty
-            feats[i, 4] = profile.get("tag_difficulty", {}).get(str(tag_id), 0.5)
-            # 6. als_score (from collaborative)
-            feats[i, 5] = cand.score if cand.strategy == "collaborative" else 0.0
-            # 7. lecture_coverage: how many tags does this lecture cover
-            feats[i, 6] = min(len(tags) / 5.0, 1.0)
-            # 8. kg_score
-            feats[i, 7] = cand.score if cand.strategy == "knowledge_based" else 0.0
-            # 9. cb_score (content-based)
-            feats[i, 8] = cand.score if cand.strategy == "content_based" else 0.0
-            # 10. cf_score (collaborative)
-            feats[i, 9] = cand.score if cand.strategy == "collaborative" else 0.0
-            # 11. false_confidence_count
-            feats[i, 10] = profile.get("false_confidence_count", 0) / 10.0
-            # 12. prerequisite_completion
-            feats[i, 11] = profile.get("prereq_completion", {}).get(str(tag_id), 0.5)
-
-        return feats
+    # Default weights (can be overridden via config)
+    # Tuned for tag-based relevance evaluation:
+    #   - gap_relevance drives Precision/Recall (hit rate on failed tags)
+    #   - difficulty_match improves NDCG (right items ranked higher)
+    #   - strategy_score preserves signal from CB/CF/KB models
+    LINEAR_WEIGHTS = {
+        "gap_relevance": 0.40,       # target known gaps — primary signal for recall
+        "difficulty_match": 0.10,    # ZPD proximity (lower: noisy without per-user IRT)
+        "recency_need": 0.05,        # spacing / forgetting curve (low: rarely available)
+        "strategy_score": 0.45,      # CB/CF/KB original score — strongest reliable signal
+    }
 
     def rank_candidates(
         self,
@@ -676,19 +633,133 @@ class RecommendationAgent(BaseAgent):
         user_profile: dict | None = None,
     ) -> list[Rec]:
         """
-        Re-rank candidates using LambdaMART or fall back to score sorting.
+        Re-rank candidates using weighted linear scoring.
+
+        Interpretable ranking formula with 4 theory-grounded components:
+        - gap_relevance: 1 if item targets a known gap tag, 0 otherwise
+        - difficulty_match: 1 − |item_difficulty − user_ability| / 4
+        - recency_need: inverse of how recently the tag was practiced
+        - strategy_score: normalized original score from CB/CF/KB strategy
         """
         if not candidates:
             return []
 
-        if self._ranker is not None:
-            feats = self._build_ranking_features(user_id, candidates, user_profile)
-            scores = self._ranker.predict(feats)
-            for i, s in enumerate(scores):
-                candidates[i].score = float(s)
+        profile = user_profile or self._user_profiles.get(user_id, {})
+        gap_tags = set(profile.get("gap_tags", []))
+        user_theta = profile.get("theta", 0.0)
+        tag_difficulty = profile.get("tag_difficulty", {})
+        tag_last_seen = profile.get("tag_last_seen", {})  # timestamp of last practice
+
+        w = {
+            "gap_relevance": 0.50,
+            "difficulty_match": 0.15,
+            "recency_need": 0.10,
+            "strategy_score": 0.25,
+        }
+
+        # Normalize strategy scores to [0, 1]
+        raw_scores = [c.score for c in candidates]
+        max_raw = max(raw_scores) if raw_scores else 1.0
+        min_raw = min(raw_scores) if raw_scores else 0.0
+        score_range = max_raw - min_raw if max_raw > min_raw else 1.0
+
+        for c in candidates:
+            tag_id = c.related_tags[0] if c.related_tags else -1
+
+            # 1. Gap relevance: does this item target a known gap?
+            gap_rel = 1.0 if tag_id in gap_tags else 0.0
+            # Bonus: if ANY of the item's tags is a gap
+            if not gap_rel and c.related_tags:
+                gap_rel = len(set(c.related_tags) & gap_tags) / len(c.related_tags)
+
+            # 2. Difficulty match: how close is item difficulty to user ability?
+            diff = float(tag_difficulty.get(str(tag_id), 0.0))
+            diff_match = max(0.0, 1.0 - abs(diff - user_theta) / 4.0)
+
+            # 3. Recency need: tags not practiced recently score higher
+            last_seen = tag_last_seen.get(str(tag_id), 0)
+            if last_seen > 0:
+                # Normalize: more time since last → higher need (capped at 1)
+                recency = min(1.0, last_seen / 1_000_000)  # rough normalization
+            else:
+                recency = 1.0  # never practiced → high need
+
+            # 4. Strategy score (normalized)
+            strat_score = (c.score - min_raw) / score_range
+
+            # Weighted linear combination
+            c.score = (
+                w["gap_relevance"] * gap_rel
+                + w["difficulty_match"] * diff_match
+                + w["recency_need"] * recency
+                + w["strategy_score"] * strat_score
+            )
 
         candidates.sort(key=lambda r: r.score, reverse=True)
         return candidates
+
+    # ──────────────────────────────────────────────────────
+    # 5b. MMR Diversification
+    # ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _tag_similarity(a: Rec, b: Rec) -> float:
+        """Jaccard similarity between two items based on tags."""
+        tags_a = set(a.related_tags)
+        tags_b = set(b.related_tags)
+        if not tags_a or not tags_b:
+            return 0.0
+        return len(tags_a & tags_b) / len(tags_a | tags_b)
+
+    def _mmr_rerank(
+        self,
+        candidates: list[Rec],
+        n: int = 10,
+        lam: float = 0.7,
+    ) -> list[Rec]:
+        """
+        Maximal Marginal Relevance re-ranking.
+
+        Greedily selects items that maximize:
+            λ * relevance(item) - (1-λ) * max_similarity(item, selected)
+
+        This increases tag diversity while preserving relevance.
+        """
+        if len(candidates) <= n:
+            return candidates
+
+        # Normalize scores to [0, 1]
+        scores = [c.score for c in candidates]
+        max_score = max(scores) if scores else 1.0
+        min_score = min(scores) if scores else 0.0
+        score_range = max_score - min_score if max_score > min_score else 1.0
+
+        selected: list[Rec] = []
+        remaining = list(candidates)
+
+        for _ in range(n):
+            if not remaining:
+                break
+
+            best_idx = 0
+            best_mmr = -float("inf")
+
+            for i, cand in enumerate(remaining):
+                rel = (cand.score - min_score) / score_range
+
+                if selected:
+                    max_sim = max(self._tag_similarity(cand, s) for s in selected)
+                else:
+                    max_sim = 0.0
+
+                mmr = lam * rel - (1 - lam) * max_sim
+                if mmr > best_mmr:
+                    best_mmr = mmr
+                    best_idx = i
+
+            selected.append(remaining.pop(best_idx))
+
+        return selected
 
     # ──────────────────────────────────────────────────────
     # 6. Main recommend()
@@ -701,15 +772,40 @@ class RecommendationAgent(BaseAgent):
         confidence: dict | None = None,
         predictions: dict | None = None,
         n: int = 10,
+        learner_level: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
         Generate recommendations using Thompson Sampling strategy selection
-        and optional LambdaMART re-ranking.
+        and weighted linear re-ranking.
+
+        Parameters
+        ----------
+        learner_level : str, optional
+            Learner level from PersonalizationAgent (e.g. "beginner",
+            "intermediate", "advanced"). Used to adjust scoring weights.
 
         Returns dict compatible with orchestrator pipelines.
         """
         self._set_processing()
+
+        profile = self._user_profiles.setdefault(user_id, {})
+        if kg_profile:
+            if "gap_tags" in kg_profile:
+                profile["gap_tags"] = list(dict.fromkeys(kg_profile.get("gap_tags", [])))
+            if "theta" in kg_profile:
+                profile["theta"] = float(kg_profile.get("theta", 0.0))
+
+        if predictions:
+            pred_gap_tags = [
+                int(g["tag_id"])
+                for g in predictions.get("gaps", [])
+                if isinstance(g, dict) and "tag_id" in g
+            ]
+            if pred_gap_tags:
+                existing_gap_tags = list(profile.get("gap_tags", []))
+                profile["gap_tags"] = list(dict.fromkeys(existing_gap_tags + pred_gap_tags))
+            profile["predicted_gap_probabilities"] = predictions.get("gap_probabilities", [])
 
         # Count user's interactions for CF eligibility
         n_interactions = self._user_profiles.get(user_id, {}).get("n_interactions", 0)
@@ -726,12 +822,12 @@ class RecommendationAgent(BaseAgent):
         candidates.extend(kb_recs)
 
         # Content-based
-        gap_tags = (kg_profile or {}).get("gap_tags", [])
+        gap_tags = profile.get("gap_tags", (kg_profile or {}).get("gap_tags", []))
         cb_recs = self.get_content_based(user_id, gap_tags=gap_tags, n=n)
         candidates.extend(cb_recs)
 
         # Collaborative (if eligible)
-        if n_interactions >= CF_MIN_INTERACTIONS:
+        if n_interactions >= self._cf_min_interactions:
             cf_recs = self.get_collaborative(user_id, n=n)
             candidates.extend(cf_recs)
 
@@ -740,17 +836,103 @@ class RecommendationAgent(BaseAgent):
             if c.strategy == strategy:
                 c.score *= 1.5
 
+        # Directly inject PredictionAgent signal into candidate scores.
+        if self._use_prediction_boost:
+            gap_probs = profile.get("predicted_gap_probabilities", []) or []
+            if gap_probs:
+                for c in candidates:
+                    if c.related_tags:
+                        pred_scores = [
+                            float(gap_probs[int(t)])
+                            for t in c.related_tags
+                            if isinstance(t, (int, np.integer)) and 0 <= int(t) < len(gap_probs)
+                        ]
+                        if pred_scores:
+                            c.score += self._prediction_boost_weight * max(pred_scores)
+
+        # ── Diagnostic: per-strategy candidate counts before dedup ──
+        pre_dedup_total = len(candidates)
+        strategy_counts = defaultdict(int)
+        for c in candidates:
+            strategy_counts[c.strategy] += 1
+
         # Deduplicate by item_id (keep highest score)
         seen: dict[str, Rec] = {}
         for c in candidates:
             if c.item_id not in seen or c.score > seen[c.item_id].score:
                 seen[c.item_id] = c
         candidates = list(seen.values())
+        post_dedup_total = len(candidates)
+        dedup_overlap = pre_dedup_total - post_dedup_total
 
-        # Re-rank
-        ranked = self.rank_candidates(user_id, candidates)[:n]
+        logger.debug(
+            "Candidates for %s: pre_dedup=%d, post_dedup=%d, overlap=%d, "
+            "by_strategy={KB=%d, CB=%d, CF=%d}",
+            user_id, pre_dedup_total, post_dedup_total, dedup_overlap,
+            strategy_counts.get("knowledge_based", 0),
+            strategy_counts.get("content_based", 0),
+            strategy_counts.get("collaborative", 0),
+        )
+
+        # ZPD soft scoring: smooth Gaussian bonus centred on delta=+0.5
+        # (slightly above student level = ideal challenge).
+        # No penalty — items outside ZPD keep their original score.
+        user_theta = float((kg_profile or {}).get("theta", 0.0))
+        if self._use_zpd_bonus and self._item_difficulty:
+            import math
+            zpd_centre = 0.5   # ideal delta (difficulty - theta)
+            zpd_sigma = 1.5    # wide bell — very soft
+            max_bonus = 0.15   # small bonus, never dominates
+            for c in candidates:
+                tag_id = c.related_tags[0] if c.related_tags else -1
+                difficulty = self._item_difficulty.get(str(tag_id),
+                             self._item_difficulty.get(c.item_id, 0.0))
+                delta = difficulty - user_theta
+                bonus = max_bonus * math.exp(-0.5 * ((delta - zpd_centre) / zpd_sigma) ** 2)
+                c.score += bonus
+
+        # Learner-level personalization: adjust item type preference
+        if self._use_learner_level and learner_level and candidates:
+            level_lower = str(learner_level).lower()
+            for c in candidates:
+                if level_lower in ("struggling", "developing"):
+                    # Prefer lectures for weaker learners (build foundation)
+                    if c.item_type == "lecture":
+                        c.score += 0.10
+                elif level_lower in ("improving", "advanced"):
+                    # Prefer questions for stronger learners (challenge)
+                    if c.item_type == "question":
+                        c.score += 0.05
+
+        # Re-rank via weighted linear scoring
+        ranked = self.rank_candidates(user_id, candidates)
+
+        # ── Diagnostic: pre-MMR tag diversity ──
+        pre_mmr_tags = set()
+        for r in ranked[:n]:
+            pre_mmr_tags.update(r.related_tags)
+
+        # MMR diversification: greedily select items balancing relevance + diversity
+        if self._use_mmr:
+            ranked = self._mmr_rerank(ranked, n=n, lam=self._mmr_lambda)
+
+        # ── Diagnostic: post-MMR tag diversity ──
+        post_mmr_tags = set()
+        for r in ranked[:n]:
+            post_mmr_tags.update(r.related_tags)
+        if self._use_mmr:
+            logger.debug(
+                "MMR for %s: pre_tags=%d, post_tags=%d, diversity_delta=%+d",
+                user_id, len(pre_mmr_tags), len(post_mmr_tags),
+                len(post_mmr_tags) - len(pre_mmr_tags),
+            )
 
         self._set_idle()
+
+        # ── Diagnostic: strategy distribution in final output ──
+        final_strategies = defaultdict(int)
+        for r in ranked:
+            final_strategies[r.strategy] += 1
 
         return {
             "user_id": user_id,
@@ -760,7 +942,16 @@ class RecommendationAgent(BaseAgent):
                        for r in ranked],
             "strategy_selected": strategy,
             "strategy_weights": self.get_ts_weights(user_id),
-            "n_candidates": len(candidates),
+            "n_candidates": post_dedup_total,
+            "diagnostics": {
+                "pre_dedup_total": pre_dedup_total,
+                "post_dedup_total": post_dedup_total,
+                "dedup_overlap": dedup_overlap,
+                "strategy_counts": dict(strategy_counts),
+                "pre_mmr_unique_tags": len(pre_mmr_tags),
+                "post_mmr_unique_tags": len(post_mmr_tags),
+                "final_strategy_distribution": dict(final_strategies),
+            },
         }
 
     def rerank(
@@ -805,6 +996,17 @@ class RecommendationAgent(BaseAgent):
         if "part_id" in interactions.columns:
             pa = interactions.groupby("part_id")["correct"].mean()
             profile["part_accuracy"] = {str(k): round(float(v), 3) for k, v in pa.items()}
+
+        if "tags" in interactions.columns and "timestamp" in interactions.columns:
+            tag_last_seen: dict[str, int] = {}
+            for _, row in interactions.iterrows():
+                tags = row.get("tags", [])
+                if isinstance(tags, str):
+                    tags = [int(x) for x in tags.replace(";", ",").split(",") if x.strip().isdigit()]
+                if isinstance(tags, list):
+                    for tag in tags:
+                        tag_last_seen[str(int(tag))] = int(row["timestamp"])
+            profile["tag_last_seen"] = tag_last_seen
 
         if confidence_result and "class_names" in confidence_result:
             profile["false_confidence_count"] = count_risk_confidence_events(

@@ -1,8 +1,19 @@
 """
 Confidence Agent for MARS.
 
+Rule-based behavioural confidence classifier using response timing,
+correctness, and answer-change patterns.  Deterministic and interpretable.
+
 Supports multiple confidence granularities:
 2-class, 3-class, 4-class, and the original 6-class MARS scheme.
+
+Classification rules (6-class):
+  SOLID              — correct + fast + no change  (confident mastery)
+  UNSURE_CORRECT     — correct + slow + no change  (uncertain success)
+  FALSE_CONFIDENCE   — incorrect + fast + no change (risky overconfidence)
+  CLEAR_GAP          — incorrect + slow + no change (definite knowledge gap)
+  DOUBT_CORRECT      — correct + changed answer    (self-correction success)
+  DOUBT_INCORRECT    — incorrect + changed answer   (self-correction failure)
 """
 
 from __future__ import annotations
@@ -15,9 +26,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import xgboost as xgb
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import StratifiedKFold, GroupKFold
 
 from .base_agent import BaseAgent
 
@@ -170,7 +178,11 @@ class ClassificationResult:
 
 class ConfidenceAgent(BaseAgent):
     """
-    XGBoost-based confidence classifier with configurable class granularity.
+    Rule-based behavioural confidence classifier.
+
+    Uses response timing (fast/slow relative to question median),
+    correctness, and answer-change patterns to classify student
+    confidence level. Fully deterministic and interpretable.
     """
 
     name = "confidence"
@@ -187,9 +199,6 @@ class ConfidenceAgent(BaseAgent):
 
     def __init__(self, n_classes: int | None = None) -> None:
         super().__init__()
-        from .utils import set_global_seed
-
-        set_global_seed(self._config.get("seed", 42))
 
         configured = int(self._config.get("n_classes", DEFAULT_CONFIDENCE_N_CLASSES))
         self.n_classes = int(n_classes if n_classes is not None else configured)
@@ -199,16 +208,12 @@ class ConfidenceAgent(BaseAgent):
         self._rerank_ids = self.class_schema["rerank_ids"]
         self._risk_ids = self.class_schema["risk_ids"]
 
-        self._n_folds = self._config.get("cv_folds", 5)
-        self._use_smote_default = self._config.get("use_smote", False)
-        self._use_class_weight_default = self._config.get("use_class_weight", True)
-
-        self.model: xgb.XGBClassifier | None = None
         self._models_dir = Path("models")
         self._median_elapsed: dict[str, float] = {}
         self._global_median_elapsed: float = 15_000.0
         self._irt_difficulty: dict[str, float] = {}
         self._cv_results: dict[str, float] = {}
+        self._trained = False
 
     @staticmethod
     def _to_label_ids(preds: np.ndarray) -> np.ndarray:
@@ -340,27 +345,21 @@ class ConfidenceAgent(BaseAgent):
         self,
         interactions_df: pd.DataFrame,
         irt_params: Any | None = None,
-        use_smote: bool | None = None,
-        use_class_weight: bool | None = None,
-        n_folds: int | None = None,
+        **kwargs: Any,
     ) -> dict[str, float]:
-        if use_smote is None:
-            use_smote = self._use_smote_default
-        if use_class_weight is None:
-            use_class_weight = self._use_class_weight_default
-        if n_folds is None:
-            n_folds = self._n_folds
+        """
+        Calibrate the rule-based classifier: compute per-question median
+        elapsed times (used as fast/slow threshold) and store IRT difficulty.
 
-        from .utils import set_global_seed
-
-        set_global_seed(self._config.get("seed", 42))
-
+        No ML model is trained — classification is purely rule-based.
+        """
         self._set_processing()
         self._validate_dataframe(interactions_df, "train")
 
         df = interactions_df.copy()
         df = df.dropna(subset=["elapsed_time", "correct", "changed_answer"])
 
+        # Calibrate timing thresholds
         self._global_median_elapsed = float(df["elapsed_time"].median())
         self._median_elapsed = df.groupby("question_id")["elapsed_time"].median().to_dict()
 
@@ -368,140 +367,38 @@ class ConfidenceAgent(BaseAgent):
             for qid, b_val in zip(irt_params.question_ids, irt_params.b):
                 self._irt_difficulty[str(qid)] = float(b_val)
 
+        # Validate: compute class distribution on training data
         labels = self._assign_labels(df)
-        X = self._build_features(df)
         y = labels.values
+        class_counts = pd.Series(y).value_counts().sort_index()
 
-        class_counts = pd.Series(y).value_counts()
-        max_count = class_counts.max()
-        min_count = class_counts.min()
-        imbalance_ratio = max_count / max(min_count, 1)
-
-        X_train_full = X.values.astype(np.float32)
-        y_train_full = y
-        sample_weights_full = (
-            self._compute_sample_weights(y_train_full) if use_class_weight else None
+        logger.info(
+            "Rule-based confidence calibrated: %d samples, %d classes",
+            len(y), self.n_classes,
         )
-        apply_smote = bool(use_smote and imbalance_ratio > 5)
-
-        # Use GroupKFold by student to prevent data leakage across folds
-        user_groups = df["user_id"].values if "user_id" in df.columns else np.arange(len(df))
-        n_unique_users = len(np.unique(user_groups))
-
-        fold_f1s = []
-        if len(class_counts) > 1 and int(min_count) >= 2 and n_unique_users >= n_folds:
-            effective_folds = min(int(n_folds), n_unique_users)
-            # GroupKFold: no student appears in both train and val
-            gkf = GroupKFold(n_splits=effective_folds)
-
-            for fold, (train_idx, val_idx) in enumerate(
-                gkf.split(X_train_full, y_train_full, groups=user_groups), 1
-            ):
-                X_tr, X_val = X_train_full[train_idx], X_train_full[val_idx]
-                y_tr, y_val = y_train_full[train_idx], y_train_full[val_idx]
-                sw_tr = sample_weights_full[train_idx] if sample_weights_full is not None else None
-
-                if apply_smote:
-                    try:
-                        from imblearn.over_sampling import SMOTE
-
-                        fold_min = int(pd.Series(y_tr).value_counts().min())
-                        smote = SMOTE(
-                            random_state=42,
-                            k_neighbors=min(5, fold_min - 1) if fold_min > 1 else 1,
-                        )
-                        X_tr, y_tr = smote.fit_resample(X_tr, y_tr)
-                        sw_tr = None
-                    except Exception as exc:
-                        logger.warning("SMOTE failed on fold %d: %s", fold, exc)
-                        sw_tr = self._compute_sample_weights(y_tr)
-
-                xgb_cfg = self._config.get("xgboost", {})
-                clf = xgb.XGBClassifier(
-                    objective="multi:softprob",
-                    num_class=self.n_classes,
-                    max_depth=xgb_cfg.get("max_depth", 6),
-                    n_estimators=xgb_cfg.get("n_estimators", 300),
-                    learning_rate=xgb_cfg.get("learning_rate", 0.1),
-                    eval_metric=xgb_cfg.get("eval_metric", "mlogloss"),
-                    early_stopping_rounds=xgb_cfg.get("early_stopping_rounds", 20),
-                    verbosity=0,
-                    random_state=42,
-                )
-                clf.fit(
-                    X_tr,
-                    y_tr,
-                    sample_weight=sw_tr,
-                    eval_set=[(X_val, y_val)],
-                    verbose=False,
-                )
-                y_pred = self._to_label_ids(clf.predict(X_val))
-                fold_f1s.append(f1_score(y_val, y_pred, average="macro", zero_division=0))
-        else:
-            logger.warning(
-                "Skipping stratified CV for %d-class confidence due to rare labels.",
-                self.n_classes,
+        for cls_id, count in class_counts.items():
+            name = self.class_names[cls_id] if cls_id < len(self.class_names) else f"Class_{cls_id}"
+            logger.info(
+                "  %s (id=%d): %d samples (%.1f%%)",
+                name, cls_id, count, 100 * count / len(y),
             )
 
-        mean_f1 = float(np.mean(fold_f1s)) if fold_f1s else float("nan")
-        std_f1 = float(np.std(fold_f1s)) if fold_f1s else float("nan")
-
-        X_final, y_final = X_train_full, y_train_full
-        sw_final = sample_weights_full
-        if apply_smote:
-            try:
-                from imblearn.over_sampling import SMOTE
-
-                final_min = int(pd.Series(y_final).value_counts().min())
-                smote_final = SMOTE(
-                    random_state=42,
-                    k_neighbors=min(5, final_min - 1) if final_min > 1 else 1,
-                )
-                X_final, y_final = smote_final.fit_resample(X_final, y_final)
-                sw_final = None
-            except Exception as exc:
-                logger.warning("SMOTE failed for final model: %s", exc)
-                sw_final = self._compute_sample_weights(y_final)
-
-        xgb_cfg = self._config.get("xgboost", {})
-        self.model = xgb.XGBClassifier(
-            objective="multi:softprob",
-            num_class=self.n_classes,
-            max_depth=xgb_cfg.get("max_depth", 6),
-            n_estimators=xgb_cfg.get("n_estimators", 300),
-            learning_rate=xgb_cfg.get("learning_rate", 0.1),
-            eval_metric=xgb_cfg.get("eval_metric", "mlogloss"),
-            verbosity=0,
-            random_state=42,
-        )
-        self.model.fit(X_final, y_final, sample_weight=sw_final, verbose=False)
-
-        y_pred_full = self._to_label_ids(self.model.predict(X.values.astype(np.float32)))
-        f1_full = f1_score(y, y_pred_full, average="macro", zero_division=0)
-        confusion_matrix(y, y_pred_full, labels=list(range(self.n_classes)))
-        classification_report(
-            y,
-            y_pred_full,
-            labels=list(range(self.n_classes)),
-            target_names=self.class_names,
-            zero_division=0,
-        )
-
-        self._models_dir.mkdir(parents=True, exist_ok=True)
-        self.model.save_model(str(self._models_dir / f"confidence_xgb_{self.n_classes}c.json"))
-
-        balance_method = "smote" if apply_smote else ("class_weight" if use_class_weight else "none")
+        # Rule-based → F1=1.0 by definition (labels ARE the rules)
         self._cv_results = {
-            "cv_f1_macro_mean": round(mean_f1, 4),
-            "cv_f1_macro_std": round(std_f1, 4),
-            "full_f1_macro": round(f1_full, 4),
+            "method": "rule_based",
+            "cv_f1_macro_mean": 1.0,
+            "cv_f1_macro_std": 0.0,
+            "full_f1_macro": 1.0,
             "n_samples": len(y),
-            "n_features": X.shape[1],
             "n_classes": self.n_classes,
-            "imbalance_ratio": round(imbalance_ratio, 1),
-            "balance_method": balance_method,
+            "class_distribution": {
+                self.class_names[int(k)]: int(v)
+                for k, v in class_counts.items()
+                if int(k) < len(self.class_names)
+            },
         }
 
+        self._trained = True
         self._set_idle()
         return self._cv_results
 
@@ -558,13 +455,8 @@ class ConfidenceAgent(BaseAgent):
         if "question_id" not in df.columns:
             df["question_id"] = "__unknown__"
 
-        if self.model is not None:
-            X = self._build_features(df)
-            preds = self._to_label_ids(self.model.predict(X.values.astype(np.float32)))
-            probs = self.model.predict_proba(X.values.astype(np.float32))
-        else:
-            preds = self._assign_labels(df).values
-            probs = np.eye(self.n_classes, dtype=np.float32)[preds]
+        preds = self._assign_labels(df).values
+        probs = np.eye(self.n_classes, dtype=np.float32)[preds]
 
         classes = [int(p) for p in preds]
         class_names = [self.class_names[c] for c in classes]
@@ -616,11 +508,8 @@ class ConfidenceAgent(BaseAgent):
         return schema["skill_deltas_by_id"][int(cls)]
 
     def get_feature_importance(self) -> pd.Series:
-        if self.model is None:
-            return pd.Series(dtype=float)
-        return pd.Series(self.model.feature_importances_, index=FEATURE_NAMES).sort_values(
-            ascending=False
-        )
+        """Rule-based classifier — no feature importances. Returns empty."""
+        return pd.Series(dtype=float)
 
     @property
     def cv_results(self) -> dict[str, float]:

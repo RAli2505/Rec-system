@@ -29,6 +29,8 @@ from .base_agent import BaseAgent
 
 logger = logging.getLogger("mars.agent.knowledge_graph")
 
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # ──────────────────────────────────────────────────────────
 # Data structures
 # ──────────────────────────────────────────────────────────
@@ -39,6 +41,7 @@ class TagGap:
     tag_id: int
     current_accuracy: float
     target_accuracy: float = 0.7
+    gap_score: float = 0.5  # Bayesian P(gap|data), higher = more likely gap
     prerequisite_tags: list[int] = field(default_factory=list)
     recommended_lectures: list[str] = field(default_factory=list)
 
@@ -114,9 +117,8 @@ class KnowledgeGraphAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__()
         # Seed fixing
-        _seed = self._config.get("seed", 42)
         from .utils import set_global_seed
-        set_global_seed(_seed)
+        set_global_seed(self.global_seed)
 
         # Config-driven parameters
         gs_cfg = self._config.get("graphsage", {})
@@ -524,7 +526,7 @@ class KnowledgeGraphAgent(BaseAgent):
         Returns tag_embeddings: (n_tags, out_dim).
         """
         from .utils import set_global_seed
-        set_global_seed(42)
+        set_global_seed(self.global_seed)
 
         # Collect tag nodes
         tag_nodes = sorted(
@@ -556,7 +558,7 @@ class KnowledgeGraphAgent(BaseAgent):
                     if 1 <= pid <= 7:
                         features[i, 1 + pid] = 1.0  # indices 2..8
 
-        x = torch.tensor(features, dtype=torch.float)
+        x = torch.tensor(features, dtype=torch.float).to(_DEVICE)
 
         # ── Edges ──
         # 1) PREREQUISITE_OF (tag→tag)
@@ -587,18 +589,30 @@ class KnowledgeGraphAgent(BaseAgent):
             logger.warning("No edges for GraphSAGE — using self-loops only")
             edge_set = {(i, i) for i in range(n_tags)}
 
-        edge_index = torch.tensor(list(edge_set), dtype=torch.long).t().contiguous()
+        edge_index = torch.tensor(list(edge_set), dtype=torch.long).t().contiguous().to(_DEVICE)
 
         # ── Train ──
         data = Data(x=x, edge_index=edge_index)
-        model = GraphSAGEModel(in_channels=9, hidden=hidden, out=out_dim)
+        model = GraphSAGEModel(in_channels=9, hidden=hidden, out=out_dim).to(_DEVICE)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        logger.info("GraphSAGE training on device: %s", _DEVICE)
 
         # Positive edges = existing; negative = random
         pos_edge_index = edge_index
         n_pos = pos_edge_index.size(1)
 
+        # Build set of positive edges for filtering negatives
+        pos_edge_set = set()
+        for i in range(pos_edge_index.size(1)):
+            s, d = int(pos_edge_index[0, i]), int(pos_edge_index[1, i])
+            pos_edge_set.add((s, d))
+
         model.train()
+        best_loss = float("inf")
+        patience = 30
+        no_improve = 0
+        best_state = None
+
         for epoch in range(1, epochs + 1):
             optimizer.zero_grad()
             z = model(data.x, data.edge_index)
@@ -607,12 +621,22 @@ class KnowledgeGraphAgent(BaseAgent):
             pos_score = model.decode(z, pos_edge_index)
             pos_label = torch.ones(n_pos)
 
-            # Negative sampling
-            neg_src = torch.randint(0, n_tags, (n_pos,))
-            neg_dst = torch.randint(0, n_tags, (n_pos,))
-            neg_edge_index = torch.stack([neg_src, neg_dst])
+            # Negative sampling: batch generate and filter out existing edges
+            n_sample = n_pos * 3  # oversample to filter
+            neg_src = torch.randint(0, n_tags, (n_sample,))
+            neg_dst = torch.randint(0, n_tags, (n_sample,))
+            # Filter: no self-loops and no existing edges
+            mask = neg_src != neg_dst
+            neg_edges_all = list(zip(neg_src[mask].tolist(), neg_dst[mask].tolist()))
+            neg_edges = [(s, d) for s, d in neg_edges_all if (s, d) not in pos_edge_set][:n_pos]
+            # Pad if needed
+            while len(neg_edges) < n_pos:
+                s, d = torch.randint(0, n_tags, (1,)).item(), torch.randint(0, n_tags, (1,)).item()
+                neg_edges.append((s, d))
+            neg_edge_index = torch.tensor(neg_edges, dtype=torch.long).t().contiguous().to(_DEVICE)
             neg_score = model.decode(z, neg_edge_index)
-            neg_label = torch.zeros(n_pos)
+            neg_label = torch.zeros(n_pos, device=_DEVICE)
+            pos_label = torch.ones(n_pos, device=_DEVICE)
 
             scores = torch.cat([pos_score, neg_score])
             labels = torch.cat([pos_label, neg_label])
@@ -624,12 +648,43 @@ class KnowledgeGraphAgent(BaseAgent):
             if epoch % 50 == 0 or epoch == 1:
                 logger.info("GraphSAGE epoch %d/%d  loss=%.4f", epoch, epochs, loss.item())
 
-        # ── Extract embeddings ──
+            # Early stopping (patience=30)
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                no_improve = 0
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    logger.info("GraphSAGE early stopping at epoch %d (patience=%d)", epoch, patience)
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        # ── Extract embeddings & compute link prediction AUC ──
         model.eval()
         with torch.no_grad():
             z = model(data.x, data.edge_index)
-        embeddings = z.numpy()
 
+            # Link prediction AUC on held-out edges
+            pos_score = model.decode(z, pos_edge_index).cpu().numpy()
+            neg_src_eval = torch.randint(0, n_tags, (n_pos,), device=_DEVICE)
+            neg_dst_eval = torch.randint(0, n_tags, (n_pos,), device=_DEVICE)
+            neg_edge_eval = torch.stack([neg_src_eval, neg_dst_eval])
+            neg_score_eval = model.decode(z, neg_edge_eval).cpu().numpy()
+
+            all_scores = np.concatenate([pos_score, neg_score_eval])
+            all_labels_np = np.concatenate([np.ones(n_pos), np.zeros(n_pos)])
+            try:
+                from sklearn.metrics import roc_auc_score
+                link_auc = float(roc_auc_score(all_labels_np, all_scores))
+            except ValueError:
+                link_auc = 0.5
+            logger.info("GraphSAGE link prediction AUC: %.4f", link_auc)
+            self._link_pred_auc = link_auc
+
+        embeddings = z.cpu().numpy()
         self.tag_embeddings = embeddings
 
         # Save
@@ -638,7 +693,11 @@ class KnowledgeGraphAgent(BaseAgent):
         torch.save(model.state_dict(), self._models_dir / "graphsage.pt")
         logger.info("Tag embeddings: shape %s, saved to %s", embeddings.shape, self._models_dir)
 
-        return embeddings
+        return {
+            "link_pred_auc": round(self._link_pred_auc, 4),
+            "n_tag_embeddings": embeddings.shape[0],
+            "embedding_dim": embeddings.shape[1],
+        }
 
     # ──────────────────────────────────────────────────────
     # 5. Cold-start
@@ -848,13 +907,25 @@ class KnowledgeGraphAgent(BaseAgent):
     # ──────────────────────────────────────────────────────
 
     def get_user_gaps(self, user_id: str) -> list[TagGap]:
-        """Return list of TagGap for all below-threshold tags."""
+        """Return list of TagGap using Bayesian gap scoring.
+
+        Gap score = P(gap | data) using Beta(1,1) prior:
+            gap_score = (n_wrong + 1) / (n_total + 2)
+
+        Higher gap_score = more likely the student has a gap.
+        Returns tags where gap_score > 0.35 (i.e. estimated error rate > 35%).
+        """
         profile = self._user_profiles.get(user_id, {})
         gaps = []
         for tid, stats in profile.items():
-            if stats["accuracy"] < MASTERY_THRESHOLD and stats["total"] >= 3:
+            n_total = stats["total"]
+            if n_total < 1:
+                continue
+            n_wrong = n_total - stats["correct"]
+            # Beta posterior: P(gap) = (n_wrong + alpha) / (n_total + alpha + beta)
+            gap_score = (n_wrong + 1) / (n_total + 2)
+            if gap_score > 0.35:
                 prereqs = self._get_prerequisites(tid)
-                # Find lectures
                 tag_node = f"tag_{tid}"
                 lectures = []
                 if self.graph.has_node(tag_node):
@@ -866,11 +937,13 @@ class KnowledgeGraphAgent(BaseAgent):
                 gaps.append(TagGap(
                     tag_id=tid,
                     current_accuracy=round(stats["accuracy"], 3),
+                    gap_score=round(gap_score, 3),
                     prerequisite_tags=prereqs,
                     recommended_lectures=lectures,
                 ))
 
-        gaps.sort(key=lambda g: g.current_accuracy)
+        gaps.sort(key=lambda g: g.gap_score if hasattr(g, 'gap_score') else 1 - g.current_accuracy,
+                  reverse=True)
         return gaps
 
     # ──────────────────────────────────────────────────────

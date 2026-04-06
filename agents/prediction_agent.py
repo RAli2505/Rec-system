@@ -44,22 +44,29 @@ logger = logging.getLogger("mars.agent.prediction")
 NUM_TAGS = 293
 NUM_PARTS = 7           # TOEIC parts 1-7
 NUM_CONF_CLASSES = DEFAULT_CONFIDENCE_N_CLASSES
-SEQ_LEN = 50            # window of recent interactions
-HORIZON = 10            # predict failures within next N questions
+SEQ_LEN = 100           # window of recent interactions (was 50 → more context)
+HORIZON = 20            # predict failures within next N questions (wider = more signal)
+MAX_TAGS_PER_STEP = 7   # max tags per question in EdNet
 
-TAG_EMB_DIM = 32
+TAG_EMB_DIM = 48        # increased for multi-tag (was 32)
 PART_EMB_DIM = 8
 CONF_EMB_DIM = 8
-SCALAR_FEATURES = 3     # correct, elapsed_norm, changed
-INPUT_DIM = TAG_EMB_DIM + SCALAR_FEATURES + PART_EMB_DIM + CONF_EMB_DIM  # 51
-HIDDEN_DIM = 128
+SCALAR_FEATURES = 5     # correct, elapsed_norm, changed, steps_since_last_tag, cumulative_accuracy
+INPUT_DIM = TAG_EMB_DIM + SCALAR_FEATURES + PART_EMB_DIM + CONF_EMB_DIM  # 69
+HIDDEN_DIM = 256        # increased (was 128)
 NUM_LAYERS = 2
-DROPOUT = 0.3
+DROPOUT = 0.25          # slightly lower for larger model
+ATTN_HEADS = 4          # multi-head attention over LSTM outputs
+LABEL_SMOOTHING = 0.05  # smooth binary labels to reduce overconfidence
 
-LEARNING_RATE = 1e-3
-BATCH_SIZE = 512
+LEARNING_RATE = 5e-4    # lower base LR, cosine scheduler will handle warmup
+BATCH_SIZE = 256         # smaller batch for larger model (memory)
 EPOCHS = 50
-PATIENCE = 5
+PATIENCE = 8            # more patience — let scheduler find better minima
+# Feature layout per timestep: [tag0..tag6, correct, elapsed, changed, part_id, conf_class,
+#                                steps_since_last_tag, cumulative_accuracy]
+# = 7 + 7 = 14 columns
+FEATURES_PER_STEP = MAX_TAGS_PER_STEP + 7  # 14
 NUM_WORKERS = 0 if __import__("sys").platform == "win32" else 4
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -87,8 +94,8 @@ class GapSequenceDataset(Dataset):
     (sequence, label) pairs for the LSTM.
 
     Each sample:
-      X : (SEQ_LEN, 5) — tag_id, correct, elapsed_norm, changed, part_id, conf_class
-          (raw ints/floats; embeddings applied inside the model)
+      X : (SEQ_LEN, FEATURES_PER_STEP) — [tag0..tag6, correct, elapsed, changed, part_id, conf_class]
+          Multi-tag: up to MAX_TAGS_PER_STEP tag IDs per timestep (0-padded).
       y : (NUM_TAGS,) — binary vector of failed tags in next HORIZON questions
     """
 
@@ -134,6 +141,15 @@ class GapSequenceDataset(Dataset):
             return [int(tags)]
         return []
 
+    @staticmethod
+    def _padded_tags(tags, max_tags: int = MAX_TAGS_PER_STEP) -> np.ndarray:
+        """Extract all tags, pad/truncate to max_tags, clamp to valid range."""
+        all_t = GapSequenceDataset._all_tags(tags)
+        result = np.zeros(max_tags, dtype=np.float32)
+        for i, t in enumerate(all_t[:max_tags]):
+            result[i] = float(np.clip(t, 0, NUM_TAGS - 1))
+        return result
+
     def _build(self, df: pd.DataFrame) -> None:
         """Build sequences per user."""
         required = {"user_id", "timestamp", "correct", "elapsed_time", "tags"}
@@ -154,32 +170,54 @@ class GapSequenceDataset(Dataset):
 
             rows = grp.reset_index(drop=True)
 
-            # Pre-compute per-row arrays
-            tag_ids = rows["tags"].apply(self._primary_tag).values
+            # Pre-compute per-row arrays — multi-tag: (N, MAX_TAGS_PER_STEP)
+            tag_matrix = np.stack(rows["tags"].apply(self._padded_tags).values)  # (N, 7)
             correct = rows["correct"].astype(float).values
             elapsed_norm = (rows["elapsed_time"] / median_elapsed).clip(0, 5).fillna(1.0).values
             changed = rows["changed_answer"].astype(float).values if "changed_answer" in rows.columns else np.zeros(len(rows))
             part_ids = (rows["part_id"].fillna(1).astype(int).values - 1).clip(0, NUM_PARTS - 1) if "part_id" in rows.columns else np.zeros(len(rows), dtype=int)
             conf_cls = rows["confidence_class"].values.astype(int) if "confidence_class" in rows.columns else np.zeros(len(rows), dtype=int)
 
-            # Clamp tag_ids to valid range
-            tag_ids = np.clip(tag_ids, 0, NUM_TAGS - 1)
-
             # All tags per row (for labels)
             all_tags_per_row = rows["tags"].apply(self._all_tags).tolist()
 
+            # === NEW FEATURES ===
+            # 1. steps_since_last_tag: how many steps since the primary tag was last seen
+            #    Captures forgetting effect — larger gaps → more likely to fail
+            steps_since = np.zeros(len(rows), dtype=np.float32)
+            tag_last_seen: dict[int, int] = {}
+            for idx in range(len(rows)):
+                primary = int(tag_matrix[idx, 0])
+                if primary in tag_last_seen:
+                    steps_since[idx] = min((idx - tag_last_seen[primary]) / 50.0, 5.0)
+                else:
+                    steps_since[idx] = 5.0  # never seen before = max
+                tag_last_seen[primary] = idx
+
+            # 2. cumulative_accuracy: running accuracy up to this point
+            #    Captures overall student performance trend
+            cum_correct = np.cumsum(correct)
+            cum_count = np.arange(1, len(rows) + 1, dtype=np.float32)
+            cumulative_acc = (cum_correct / cum_count).astype(np.float32)
+
             n = len(rows)
-            # Stride = horizon to avoid overlapping labels (prevents data leakage)
-            for i in range(0, n - self.seq_len - self.horizon + 1, self.horizon):
-                # Input sequence: rows [i : i+seq_len]
-                seq = np.stack([
-                    tag_ids[i:i + self.seq_len],
-                    correct[i:i + self.seq_len],
-                    elapsed_norm[i:i + self.seq_len],
-                    changed[i:i + self.seq_len],
-                    part_ids[i:i + self.seq_len],
-                    conf_cls[i:i + self.seq_len],
-                ], axis=1).astype(np.float32)  # (seq_len, 6)
+            # Stride = horizon//2: overlapping windows for more training data
+            # Label leakage is minimal since labels are computed from FUTURE data
+            stride = max(1, self.horizon // 2)
+            for i in range(0, n - self.seq_len - self.horizon + 1, stride):
+                sl = slice(i, i + self.seq_len)
+                # Input: [tag0..tag6, correct, elapsed, changed, part_id, conf_class,
+                #         steps_since_last_tag, cumulative_accuracy] = 14 cols
+                seq = np.column_stack([
+                    tag_matrix[sl],                                  # (seq_len, 7)
+                    correct[sl].reshape(-1, 1),                      # (seq_len, 1)
+                    elapsed_norm[sl].reshape(-1, 1),                 # (seq_len, 1)
+                    changed[sl].reshape(-1, 1),                      # (seq_len, 1)
+                    part_ids[sl].reshape(-1, 1).astype(np.float32),  # (seq_len, 1)
+                    conf_cls[sl].reshape(-1, 1).astype(np.float32),  # (seq_len, 1)
+                    steps_since[sl].reshape(-1, 1),                  # (seq_len, 1) NEW
+                    cumulative_acc[sl].reshape(-1, 1),               # (seq_len, 1) NEW
+                ]).astype(np.float32)  # (seq_len, 14)
 
                 # Label: tags failed in next HORIZON questions
                 label = np.zeros(NUM_TAGS, dtype=np.float32)
@@ -195,9 +233,9 @@ class GapSequenceDataset(Dataset):
                 self.labels.append(label)
 
         logger.info(
-            "Built %d sequences (seq_len=%d, horizon=%d) from %d users",
+            "Built %d sequences (seq_len=%d, horizon=%d, features=%d) from %d users",
             len(self.sequences), self.seq_len, self.horizon,
-            df["user_id"].nunique(),
+            FEATURES_PER_STEP, df["user_id"].nunique(),
         )
 
     def __len__(self) -> int:
@@ -216,28 +254,29 @@ class GapSequenceDataset(Dataset):
 
 class GapPredictionLSTM(nn.Module):
     """
-    LSTM that predicts per-tag failure probability from a sequence
-    of student interactions.
+    LSTM with multi-tag input + attention pooling for per-tag failure prediction.
 
-    Input per timestep (6 raw values):
-        tag_id (int) → Embedding(293, 32)
+    Input per timestep (FEATURES_PER_STEP=12 values):
+        tag0..tag6 (int) → sum of Embedding(293, 48) for non-zero tags
         correct (float, 0/1)
         elapsed_norm (float)
         changed (float, 0/1)
         part_id (int 0-6) → Embedding(7, 8)
         conf_class (int 0-5) → Embedding(6, 8)
 
-    After embedding: 32 + 1 + 1 + 1 + 8 + 8 = 51 → LSTM(51, 128, 2)
-    Output: Linear(128, 293) → sigmoid
+    After embedding: 48 + 5 + 8 + 8 = 69 → BiLSTM(69, 256, 2) → 512-dim
+    Attention pooling → MLP head → Linear(256, 293)
     """
 
     def __init__(self, num_conf_classes: int = NUM_CONF_CLASSES) -> None:
         super().__init__()
         self.num_conf_classes = num_conf_classes
 
-        self.tag_embedding = nn.Embedding(NUM_TAGS, TAG_EMB_DIM, padding_idx=0)
+        self.tag_embedding = nn.Embedding(NUM_TAGS + 1, TAG_EMB_DIM, padding_idx=0)
         self.part_embedding = nn.Embedding(NUM_PARTS, PART_EMB_DIM)
         self.confidence_embedding = nn.Embedding(num_conf_classes, CONF_EMB_DIM)
+
+        self.input_dropout = nn.Dropout(0.1)
 
         self.lstm = nn.LSTM(
             input_size=INPUT_DIM,
@@ -245,39 +284,88 @@ class GapPredictionLSTM(nn.Module):
             num_layers=NUM_LAYERS,
             dropout=DROPOUT,
             batch_first=True,
+            bidirectional=True,
         )
 
-        self.fc = nn.Linear(HIDDEN_DIM, NUM_TAGS)
+        lstm_out_dim = HIDDEN_DIM * 2  # bidirectional doubles output
+
+        # Attention pooling: learn which timesteps matter most for prediction
+        self.attn_w = nn.Linear(lstm_out_dim, 1, bias=False)
+
+        # Deeper MLP head with residual connection
+        self.fc = nn.Sequential(
+            nn.LayerNorm(lstm_out_dim),
+            nn.Linear(lstm_out_dim, HIDDEN_DIM),
+            nn.GELU(),
+            nn.Dropout(DROPOUT),
+            nn.Linear(HIDDEN_DIM, NUM_TAGS),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
-        x : (batch, seq_len, 6)
-            Columns: tag_id, correct, elapsed_norm, changed, part_id, conf_class
+        x : (batch, seq_len, FEATURES_PER_STEP)
+            Columns: [tag0..tag6, correct, elapsed, changed, part_id, conf_class]
 
         Returns
         -------
-        (batch, NUM_TAGS) probabilities in [0, 1]
+        (batch, NUM_TAGS) logits
         """
-        tag_ids = x[:, :, 0].long().clamp(0, NUM_TAGS - 1)
-        correct = x[:, :, 1:2]          # (B, T, 1)
-        elapsed = x[:, :, 2:3]          # (B, T, 1)
-        changed = x[:, :, 3:4]          # (B, T, 1)
-        part_ids = x[:, :, 4].long().clamp(0, NUM_PARTS - 1)
-        conf_ids = x[:, :, 5].long().clamp(0, self.num_conf_classes - 1)
+        # Multi-tag: columns 0..6 are tag IDs (0-padded)
+        tag_ids = x[:, :, :MAX_TAGS_PER_STEP].long().clamp(0, NUM_TAGS)  # (B, T, 7)
+        correct = x[:, :, MAX_TAGS_PER_STEP:MAX_TAGS_PER_STEP + 1]      # (B, T, 1)
+        elapsed = x[:, :, MAX_TAGS_PER_STEP + 1:MAX_TAGS_PER_STEP + 2]  # (B, T, 1)
+        changed = x[:, :, MAX_TAGS_PER_STEP + 2:MAX_TAGS_PER_STEP + 3]  # (B, T, 1)
+        part_ids = x[:, :, MAX_TAGS_PER_STEP + 3].long().clamp(0, NUM_PARTS - 1)
+        conf_ids = x[:, :, MAX_TAGS_PER_STEP + 4].long().clamp(0, self.num_conf_classes - 1)
+        steps_since = x[:, :, MAX_TAGS_PER_STEP + 5:MAX_TAGS_PER_STEP + 6]
+        cumulative_acc = x[:, :, MAX_TAGS_PER_STEP + 6:MAX_TAGS_PER_STEP + 7]
 
-        tag_emb = self.tag_embedding(tag_ids)       # (B, T, 32)
-        part_emb = self.part_embedding(part_ids)     # (B, T, 8)
-        conf_emb = self.confidence_embedding(conf_ids)  # (B, T, 8)
+        # Sum-of-embeddings for all tags (masked: ignore padding=0)
+        tag_emb_all = self.tag_embedding(tag_ids)     # (B, T, 7, 48)
+        tag_mask = (tag_ids > 0).unsqueeze(-1).float()  # (B, T, 7, 1)
+        n_tags = tag_mask.sum(dim=2).clamp(min=1)     # (B, T, 1)
+        tag_emb = (tag_emb_all * tag_mask).sum(dim=2) / n_tags  # (B, T, 48) mean pooling
 
-        # Concatenate: (B, T, 32+1+1+1+8+8) = (B, T, 51)
-        combined = torch.cat([tag_emb, correct, elapsed, changed, part_emb, conf_emb], dim=-1)
+        part_emb = self.part_embedding(part_ids)       # (B, T, 8)
+        conf_emb = self.confidence_embedding(conf_ids) # (B, T, 8)
 
-        lstm_out, _ = self.lstm(combined)            # (B, T, 128)
-        last_hidden = lstm_out[:, -1, :]             # (B, 128)
-        logits = self.fc(last_hidden)                # (B, 293)
+        # Concatenate: (B, T, 48+5+8+8) = (B, T, 69)
+        combined = torch.cat(
+            [tag_emb, correct, elapsed, changed, steps_since, cumulative_acc, part_emb, conf_emb],
+            dim=-1,
+        )
+        combined = self.input_dropout(combined)
+
+        lstm_out, _ = self.lstm(combined)              # (B, T, 512) bidirectional
+
+        # Attention pooling: weighted combination of all timesteps
+        attn_scores = self.attn_w(lstm_out).squeeze(-1)   # (B, T)
+        attn_weights = torch.softmax(attn_scores, dim=-1) # (B, T)
+        context = torch.bmm(attn_weights.unsqueeze(1), lstm_out).squeeze(1)  # (B, 256)
+
+        logits = self.fc(context)                      # (B, 293)
         return logits  # raw logits; use BCEWithLogitsLoss for training
+
+
+def _multi_tag_embed(tag_embedding, x):
+    """Shared multi-tag embedding: mean-pool non-zero tag embeddings."""
+    tag_ids = x[:, :, :MAX_TAGS_PER_STEP].long().clamp(0, NUM_TAGS)
+    correct = x[:, :, MAX_TAGS_PER_STEP:MAX_TAGS_PER_STEP + 1]
+    elapsed = x[:, :, MAX_TAGS_PER_STEP + 1:MAX_TAGS_PER_STEP + 2]
+    changed = x[:, :, MAX_TAGS_PER_STEP + 2:MAX_TAGS_PER_STEP + 3]
+    part_ids = x[:, :, MAX_TAGS_PER_STEP + 3].long().clamp(0, NUM_PARTS - 1)
+    conf_ids = x[:, :, MAX_TAGS_PER_STEP + 4].long()
+    steps_since = x[:, :, MAX_TAGS_PER_STEP + 5:MAX_TAGS_PER_STEP + 6]
+    cumulative_acc = x[:, :, MAX_TAGS_PER_STEP + 6:MAX_TAGS_PER_STEP + 7]
+
+    tag_emb_all = tag_embedding(tag_ids)
+    tag_mask = (tag_ids > 0).unsqueeze(-1).float()
+    n_tags = tag_mask.sum(dim=2).clamp(min=1)
+    tag_emb = (tag_emb_all * tag_mask).sum(dim=2) / n_tags
+
+    return tag_emb, correct, elapsed, changed, part_ids, conf_ids, steps_since, cumulative_acc
 
 
 class GapPredictionGRU(nn.Module):
@@ -298,7 +386,7 @@ class GapPredictionGRU(nn.Module):
         super().__init__()
         self.num_conf_classes = num_conf_classes
 
-        self.tag_embedding = nn.Embedding(NUM_TAGS, TAG_EMB_DIM, padding_idx=0)
+        self.tag_embedding = nn.Embedding(NUM_TAGS + 1, TAG_EMB_DIM, padding_idx=0)
         self.part_embedding = nn.Embedding(NUM_PARTS, PART_EMB_DIM)
         self.confidence_embedding = nn.Embedding(num_conf_classes, CONF_EMB_DIM)
 
@@ -313,18 +401,14 @@ class GapPredictionGRU(nn.Module):
         self.fc = nn.Linear(hidden_dim, NUM_TAGS)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        tag_ids = x[:, :, 0].long().clamp(0, NUM_TAGS - 1)
-        correct = x[:, :, 1:2]
-        elapsed = x[:, :, 2:3]
-        changed = x[:, :, 3:4]
-        part_ids = x[:, :, 4].long().clamp(0, NUM_PARTS - 1)
-        conf_ids = x[:, :, 5].long().clamp(0, self.num_conf_classes - 1)
-
-        tag_emb = self.tag_embedding(tag_ids)
+        tag_emb, correct, elapsed, changed, part_ids, conf_ids, steps_since, cumulative_acc = _multi_tag_embed(self.tag_embedding, x)
+        conf_ids = conf_ids.clamp(0, self.num_conf_classes - 1)
         part_emb = self.part_embedding(part_ids)
         conf_emb = self.confidence_embedding(conf_ids)
-
-        combined = torch.cat([tag_emb, correct, elapsed, changed, part_emb, conf_emb], dim=-1)
+        combined = torch.cat(
+            [tag_emb, correct, elapsed, changed, steps_since, cumulative_acc, part_emb, conf_emb],
+            dim=-1,
+        )
 
         gru_out, _ = self.gru(combined)
         last_hidden = gru_out[:, -1, :]
@@ -333,74 +417,138 @@ class GapPredictionGRU(nn.Module):
 
 class GapPredictionTransformer(nn.Module):
     """
-    Transformer encoder for seq-to-set knowledge gap prediction.
+    SAINT-inspired Transformer for seq-to-set knowledge gap prediction.
+
+    Architecture draws from SAINT (Choi et al., 2020) and AKT (Ghosh et al., 2020):
+      - Separate exercise stream (tags, part, difficulty) and response stream
+        (correct, elapsed, changed, confidence) merged via gated fusion
+      - Deep encoder (4 layers, 256 dim) with pre-norm for stable training
+      - Sinusoidal + learnable positional encoding
+      - Multi-query attention pooling over all timesteps (not just last)
+      - MLP head with residual connection
 
     Same input/output format as LSTM/GRU for fair comparison.
-    Uses learnable positional encoding and causal self-attention.
-
-    Key difference: no recurrent state — requires full sequence
-    re-computation for each new interaction (O(T) vs O(1) for LSTM).
     """
 
     def __init__(
         self,
-        d_model: int = 128,
+        d_model: int = 256,
         nhead: int = 8,
-        num_layers: int = 2,
-        dim_feedforward: int = 256,
+        num_layers: int = 4,
+        dim_feedforward: int = 512,
         dropout: float = 0.1,
         seq_len: int = SEQ_LEN,
         num_conf_classes: int = NUM_CONF_CLASSES,
     ) -> None:
         super().__init__()
+        self.d_model = d_model
         self.num_conf_classes = num_conf_classes
 
-        self.tag_embedding = nn.Embedding(NUM_TAGS, TAG_EMB_DIM, padding_idx=0)
+        # ── Exercise stream embeddings ──
+        self.tag_embedding = nn.Embedding(NUM_TAGS + 1, TAG_EMB_DIM, padding_idx=0)
         self.part_embedding = nn.Embedding(NUM_PARTS, PART_EMB_DIM)
-        self.confidence_embedding = nn.Embedding(num_conf_classes, CONF_EMB_DIM)
 
-        self.input_proj = nn.Linear(INPUT_DIM, d_model)
-        self.pos_encoding = nn.Parameter(
-            torch.randn(1, seq_len, d_model) * 0.02
+        # ── Response stream embeddings ──
+        self.confidence_embedding = nn.Embedding(num_conf_classes, CONF_EMB_DIM)
+        self.correct_embedding = nn.Embedding(2, 16)  # correct/incorrect
+
+        # ── Projections to d_model ──
+        exercise_dim = TAG_EMB_DIM + PART_EMB_DIM + 1  # tag + part + steps_since
+        response_dim = 16 + CONF_EMB_DIM + 3  # correct_emb + conf + elapsed + changed + cum_acc
+        self.exercise_proj = nn.Linear(exercise_dim, d_model)
+        self.response_proj = nn.Linear(response_dim, d_model)
+
+        # ── Gated fusion of exercise + response ──
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid(),
         )
 
+        # ── Positional encoding (sinusoidal + learnable) ──
+        self.pos_encoding = nn.Parameter(torch.zeros(1, seq_len, d_model))
+        self._init_sinusoidal_pe(seq_len, d_model)
+        self.pos_learnable = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
+
+        self.input_dropout = nn.Dropout(dropout)
+        self.input_norm = nn.LayerNorm(d_model)
+
+        # ── Transformer encoder (pre-norm for stable deep training) ──
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
+            norm_first=True,  # pre-norm: more stable for deeper models
         )
         self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers
+            encoder_layer, num_layers=num_layers,
+            norm=nn.LayerNorm(d_model),
         )
 
-        self.fc = nn.Linear(d_model, NUM_TAGS)
+        # ── Multi-query attention pooling ──
+        self.pool_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pool_attn = nn.MultiheadAttention(
+            d_model, num_heads=4, dropout=dropout, batch_first=True,
+        )
+
+        # ── MLP head ──
+        self.fc = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, HIDDEN_DIM),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(HIDDEN_DIM, NUM_TAGS),
+        )
+
+    def _init_sinusoidal_pe(self, max_len: int, d_model: int) -> None:
+        """Initialize sinusoidal positional encoding (not learned)."""
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[:d_model // 2])
+        self.pos_encoding.data.copy_(pe.unsqueeze(0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        tag_ids = x[:, :, 0].long().clamp(0, NUM_TAGS - 1)
-        correct = x[:, :, 1:2]
-        elapsed = x[:, :, 2:3]
-        changed = x[:, :, 3:4]
-        part_ids = x[:, :, 4].long().clamp(0, NUM_PARTS - 1)
-        conf_ids = x[:, :, 5].long().clamp(0, self.num_conf_classes - 1)
-
-        tag_emb = self.tag_embedding(tag_ids)
+        tag_emb, correct, elapsed, changed, part_ids, conf_ids, steps_since, cumulative_acc = _multi_tag_embed(self.tag_embedding, x)
+        conf_ids = conf_ids.clamp(0, self.num_conf_classes - 1)
         part_emb = self.part_embedding(part_ids)
         conf_emb = self.confidence_embedding(conf_ids)
+        correct_emb = self.correct_embedding(correct.squeeze(-1).long().clamp(0, 1))
 
-        combined = torch.cat([tag_emb, correct, elapsed, changed, part_emb, conf_emb], dim=-1)
+        # ── Exercise stream: what was asked ──
+        exercise = torch.cat([tag_emb, part_emb, steps_since], dim=-1)
+        exercise = self.exercise_proj(exercise)  # (B, T, d_model)
 
-        # Project to d_model and add positional encoding
-        h = self.input_proj(combined) + self.pos_encoding[:, :combined.size(1), :]
+        # ── Response stream: how the student answered ──
+        response = torch.cat([correct_emb, conf_emb, elapsed, changed, cumulative_acc], dim=-1)
+        response = self.response_proj(response)  # (B, T, d_model)
 
-        # Causal mask: each position can only attend to itself and earlier
+        # ── Gated fusion ──
+        gate_input = torch.cat([exercise, response], dim=-1)
+        gate_weight = self.gate(gate_input)
+        h = gate_weight * exercise + (1 - gate_weight) * response
+
+        # ── Add positional encoding ──
         seq_len = h.size(1)
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(h.device)
+        h = h + self.pos_encoding[:, :seq_len, :] + self.pos_learnable[:, :seq_len, :]
+        h = self.input_norm(h)
+        h = self.input_dropout(h)
 
-        h = self.transformer(h, mask=causal_mask)
-        last_hidden = h[:, -1, :]
-        return self.fc(last_hidden)
+        # ── Causal mask ──
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(h.device)
+        h = self.transformer(h, mask=causal_mask)  # (B, T, d_model)
+
+        # ── Multi-query attention pooling ──
+        query = self.pool_query.expand(h.size(0), -1, -1)  # (B, 1, d_model)
+        pooled, _ = self.pool_attn(query, h, h)  # (B, 1, d_model)
+        pooled = pooled.squeeze(1)  # (B, d_model)
+
+        return self.fc(pooled)  # (B, NUM_TAGS)
 
 
 # ──────────────────────────────────────────────────────────
@@ -448,9 +596,8 @@ class PredictionAgent(BaseAgent):
     def __init__(self, model_type: str | None = None) -> None:
         super().__init__()
         # Seed fixing
-        _seed = self._config.get("seed", 42)
         from .utils import set_global_seed
-        set_global_seed(_seed)
+        set_global_seed(self.global_seed)
 
         # Model type from argument or config
         self.model_type = model_type or self._config.get("model", "lstm")
@@ -549,7 +696,7 @@ class PredictionAgent(BaseAgent):
             patience = self._patience
 
         from .utils import set_global_seed
-        set_global_seed(self._config.get("seed", 42))
+        set_global_seed(self.global_seed)
 
         self._set_processing()
         self._validate_dataframe(interactions_df, "train")
@@ -559,7 +706,7 @@ class PredictionAgent(BaseAgent):
         if val_df is None:
             users = interactions_df["user_id"].unique()
             n_val = max(1, int(len(users) * 0.15))
-            rng = np.random.RandomState(42)
+            rng = np.random.RandomState(self.global_seed)
             val_users = set(rng.choice(users, size=n_val, replace=False))
             val_df = interactions_df[interactions_df["user_id"].isin(val_users)]
             train_df = interactions_df[~interactions_df["user_id"].isin(val_users)]
@@ -591,13 +738,56 @@ class PredictionAgent(BaseAgent):
         )
 
         # ── Model, loss, optimizer ──
+        # Pass architecture params from config to model constructor
+        model_cfg = self._config.get(self.model_type, self._config.get("lstm", {}))
+        model_arch_kwargs = {
+            k: v for k, v in model_cfg.items()
+            if k in ("d_model", "nhead", "num_layers", "dim_feedforward",
+                     "hidden_dim", "dropout")
+        }
         model = create_model(
             self.model_type,
             num_conf_classes=self._num_conf_classes,
+            **model_arch_kwargs,
         ).to(DEVICE)
-        logger.info("Using %s encoder (%s)", self.model_type, model.__class__.__name__)
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        n_params = sum(p.numel() for p in model.parameters())
+        logger.info(
+            "Using %s encoder (%s) — %.2fM params",
+            self.model_type, model.__class__.__name__, n_params / 1e6,
+        )
+
+        # Focal Loss for extreme class imbalance (~1% positive per tag)
+        # Focuses learning on hard-to-classify examples, reduces easy-negative dominance
+        all_labels = np.stack(train_dataset.labels)  # (N, NUM_TAGS)
+        pos_rate = all_labels.mean(axis=0)            # (NUM_TAGS,)
+        pw = np.where(pos_rate > 0, (1.0 - pos_rate) / (pos_rate + 1e-8), 1.0)
+        pw = np.clip(pw, 1.0, 50.0)
+        pos_weight = torch.tensor(pw, dtype=torch.float32).to(DEVICE)
+        logger.info(
+            "pos_weight: min=%.1f, median=%.1f, max=%.1f",
+            pw.min(), np.median(pw), pw.max(),
+        )
+        focal_gamma = 2.0  # focus parameter: higher = more focus on hard examples
+
+        def focal_bce_loss(logits, targets):
+            """Focal BCE loss: down-weights easy examples, emphasizes hard ones."""
+            # Label smoothing: soften 0/1 targets to reduce overconfidence
+            targets = targets * (1 - LABEL_SMOOTHING) + 0.5 * LABEL_SMOOTHING
+            bce = nn.functional.binary_cross_entropy_with_logits(
+                logits, targets, pos_weight=pos_weight, reduction="none",
+            )
+            probs = torch.sigmoid(logits)
+            # p_t = probability assigned to the correct class
+            p_t = probs * targets + (1 - probs) * (1 - targets)
+            focal_weight = (1 - p_t) ** focal_gamma
+            return (focal_weight * bce).mean()
+
+        criterion = focal_bce_loss
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        # CosineAnnealing with warm restarts — better exploration of loss landscape
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=10, T_mult=2, eta_min=1e-6,
+        )
 
         # ── Training loop ──
         best_val_loss = float("inf")
@@ -641,10 +831,14 @@ class PredictionAgent(BaseAgent):
 
             history["val_loss"].append(avg_val_loss)
 
+            # Step the cosine scheduler per epoch
+            scheduler.step(epoch)
+
+            current_lr = optimizer.param_groups[0]["lr"]
             if epoch % 5 == 1 or epoch == epochs:
                 logger.info(
-                    "Epoch %d/%d  train_loss=%.4f  val_loss=%.4f",
-                    epoch, epochs, avg_train_loss, avg_val_loss,
+                    "Epoch %d/%d  train_loss=%.4f  val_loss=%.4f  lr=%.2e",
+                    epoch, epochs, avg_train_loss, avg_val_loss, current_lr,
                 )
 
             # --- Early stopping ---
@@ -666,11 +860,68 @@ class PredictionAgent(BaseAgent):
         # Restore best weights
         if best_state is not None:
             model.load_state_dict(best_state)
+
+        # ── Stochastic Weight Averaging (SWA) phase ──
+        # Fine-tune from best checkpoint with high LR for 5 epochs,
+        # average weights for flatter minima → better generalization
+        swa_epochs = 5
+        swa_lr = lr * 0.5
+        logger.info("Starting SWA phase (%d epochs, lr=%.2e)", swa_epochs, swa_lr)
+        swa_model = torch.optim.swa_utils.AveragedModel(model)
+        swa_optimizer = torch.optim.SGD(model.parameters(), lr=swa_lr, momentum=0.9)
+        swa_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            swa_optimizer, T_max=swa_epochs, eta_min=swa_lr * 0.1,
+        )
+        for swa_ep in range(swa_epochs):
+            model.train()
+            for X_batch, y_batch in train_loader:
+                X_batch = X_batch.to(DEVICE)
+                y_batch = y_batch.to(DEVICE)
+                swa_optimizer.zero_grad()
+                loss = criterion(model(X_batch), y_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                swa_optimizer.step()
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+
+        # Use SWA averaged weights
+        torch.optim.swa_utils.update_bn(train_loader, swa_model, device=DEVICE)
+        model = swa_model.module
         model.eval()
         self.model = model
 
         # ── Compute validation AUC ──
         val_auc = self._compute_val_auc(model, val_loader) if val_loader else float("nan")
+
+        # ── Find optimal threshold on validation set (maximize F1-micro) ──
+        best_thr, best_f1 = 0.5, 0.0
+        if val_loader is not None:
+            from sklearn.metrics import f1_score
+            model.eval()
+            all_preds_v, all_labels_v = [], []
+            with torch.no_grad():
+                for X_b, y_b in val_loader:
+                    X_b = X_b.to(DEVICE)
+                    p = torch.sigmoid(model(X_b)).cpu().numpy()
+                    all_preds_v.append(p)
+                    all_labels_v.append(y_b.numpy())
+            y_pred_v = np.concatenate(all_preds_v)
+            y_true_v = np.concatenate(all_labels_v)
+            # Fine-grained threshold search: 0.005 to 0.50 in 40 steps
+            for thr in np.concatenate([
+                np.arange(0.005, 0.05, 0.005),   # very fine at low end
+                np.arange(0.05, 0.15, 0.01),      # fine in typical range
+                np.arange(0.15, 0.51, 0.05),      # coarser at high end
+            ]):
+                y_bin = (y_pred_v >= thr).astype(int)
+                if y_bin.sum() == 0:
+                    continue
+                f1 = f1_score(y_true_v.ravel(), y_bin.ravel(), zero_division=0.0)
+                if f1 > best_f1:
+                    best_f1, best_thr = f1, float(thr)
+            logger.info("Optimal threshold=%.3f → val F1-micro=%.4f", best_thr, best_f1)
+        self._optimal_threshold = best_thr
 
         # Save model
         self._models_dir.mkdir(parents=True, exist_ok=True)
@@ -682,6 +933,8 @@ class PredictionAgent(BaseAgent):
             "train_loss": round(history["train_loss"][best_epoch - 1], 4) if best_epoch > 0 else round(avg_train_loss, 4),
             "val_loss": round(best_val_loss, 4),
             "val_auc": round(val_auc, 4),
+            "optimal_threshold": best_thr,
+            "val_f1_at_threshold": round(best_f1, 4),
             "model_type": self.model_type,
             "n_train_sequences": len(train_dataset),
             "n_val_sequences": len(val_dataset) if val_dataset else 0,
@@ -743,7 +996,7 @@ class PredictionAgent(BaseAgent):
         recent: pd.DataFrame | list[dict] | None = None,
         diagnostic: dict | None = None,
         kg_profile: dict | None = None,
-        threshold: float = 0.5,
+        threshold: float | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
@@ -760,14 +1013,17 @@ class PredictionAgent(BaseAgent):
             Output from DiagnosticAgent (unused here, available for context).
         kg_profile : dict, optional
             Output from KGAgent (unused here, available for context).
-        threshold : float
-            Probability threshold for flagging a gap.
+        threshold : float, optional
+            Probability threshold for flagging a gap. If None, uses the
+            optimal threshold found during training (default 0.5 fallback).
 
         Returns
         -------
         dict with keys: user_id, gaps (list of PredictedGap dicts),
               gap_probabilities (full 293-dim array), n_gaps
         """
+        if threshold is None:
+            threshold = getattr(self, "_optimal_threshold", 0.5)
         self._set_processing()
 
         if self.model is None:
@@ -793,7 +1049,7 @@ class PredictionAgent(BaseAgent):
         # Predict
         self.model.eval()
         with torch.no_grad():
-            x = torch.from_numpy(seq).unsqueeze(0).to(DEVICE)  # (1, SEQ_LEN, 6)
+            x = torch.from_numpy(seq).unsqueeze(0).to(DEVICE)  # (1, SEQ_LEN, FEATURES_PER_STEP)
             probs = torch.sigmoid(self.model(x)).squeeze(0).cpu().numpy()  # (293,)
 
         # Build gap list
@@ -849,17 +1105,11 @@ class PredictionAgent(BaseAgent):
         if interaction is None:
             return {"user_id": user_id, "gaps": [], "n_gaps": 0}
 
-        # Build interaction vector: [tag_id, correct, elapsed_norm, changed, part_id, conf_class]
+        # Build interaction vector with the same feature layout used in training.
         tags = interaction.get("tags", [])
-        if isinstance(tags, str):
-            parts = tags.replace(";", ",").split(",")
-            tag_id = int(parts[0].strip()) if parts and parts[0].strip().isdigit() else 0
-        elif isinstance(tags, list) and len(tags) > 0:
-            tag_id = int(tags[0])
-        else:
-            tag_id = 0
+        padded_tags = GapSequenceDataset._padded_tags(tags)
+        primary_tag = int(padded_tags[0]) if len(padded_tags) > 0 else 0
 
-        tag_id = min(max(tag_id, 0), NUM_TAGS - 1)
         correct = float(interaction.get("correct", 0))
         elapsed = float(interaction.get("elapsed_time", 15000)) / 15000.0
         elapsed = min(max(elapsed, 0), 5.0)
@@ -869,8 +1119,24 @@ class PredictionAgent(BaseAgent):
         conf_class = int(interaction.get("confidence_class", 0))
         conf_class = min(max(conf_class, 0), self._num_conf_classes - 1)
 
-        vec = np.array([tag_id, correct, elapsed, changed, part_id, conf_class],
-                       dtype=np.float32)
+        history = self._user_sequences.get(user_id, [])
+        prev_primary_tags = [int(vec[0]) for vec in history if len(vec) > 0]
+        if primary_tag in prev_primary_tags:
+            last_idx = max(i for i, tag in enumerate(prev_primary_tags) if tag == primary_tag)
+            steps_since = min((len(history) - last_idx) / 50.0, 5.0)
+        else:
+            steps_since = 5.0
+
+        prev_correct = [float(vec[MAX_TAGS_PER_STEP]) for vec in history if len(vec) > MAX_TAGS_PER_STEP]
+        cumulative_acc = float((sum(prev_correct) + correct) / max(len(prev_correct) + 1, 1))
+
+        vec = np.concatenate([
+            padded_tags,
+            np.array(
+                [correct, elapsed, changed, part_id, conf_class, steps_since, cumulative_acc],
+                dtype=np.float32,
+            ),
+        ])
 
         # Append to user buffer
         if user_id not in self._user_sequences:
@@ -883,7 +1149,7 @@ class PredictionAgent(BaseAgent):
 
         # Predict if we have enough history
         if len(self._user_sequences[user_id]) >= SEQ_LEN and self.model is not None:
-            seq = np.stack(self._user_sequences[user_id][-SEQ_LEN:])  # (SEQ_LEN, 6)
+            seq = np.stack(self._user_sequences[user_id][-SEQ_LEN:])
             self.model.eval()
             with torch.no_grad():
                 x = torch.from_numpy(seq).unsqueeze(0).to(DEVICE)
@@ -918,7 +1184,7 @@ class PredictionAgent(BaseAgent):
         recent: pd.DataFrame | list[dict] | None,
     ) -> np.ndarray | None:
         """
-        Build a (SEQ_LEN, 6) input array from recent interactions.
+        Build a (SEQ_LEN, FEATURES_PER_STEP) input array from recent interactions.
 
         If fewer than SEQ_LEN interactions, left-pad with zeros.
         If recent is None, try the user's internal buffer.
@@ -930,7 +1196,7 @@ class PredictionAgent(BaseAgent):
                 return None
             if len(buf) >= SEQ_LEN:
                 return np.stack(buf[-SEQ_LEN:])
-            pad = np.zeros((SEQ_LEN - len(buf), 6), dtype=np.float32)
+            pad = np.zeros((SEQ_LEN - len(buf), FEATURES_PER_STEP), dtype=np.float32)
             return np.vstack([pad, np.stack(buf)])
 
         if isinstance(recent, list):
@@ -939,15 +1205,40 @@ class PredictionAgent(BaseAgent):
         if len(recent) == 0:
             return None
 
+        recent = recent.sort_values("timestamp").reset_index(drop=True)
+
+        median_elapsed = recent["elapsed_time"].median() if "elapsed_time" in recent.columns else 15_000.0
+        if median_elapsed == 0 or pd.isna(median_elapsed):
+            median_elapsed = 15_000.0
+
+        tag_matrix = np.stack(recent["tags"].apply(GapSequenceDataset._padded_tags).values)
+        correct_series = (
+            recent["correct"].astype(float).values
+            if "correct" in recent.columns
+            else np.zeros(len(recent), dtype=np.float32)
+        )
+
+        steps_since = np.zeros(len(recent), dtype=np.float32)
+        tag_last_seen: dict[int, int] = {}
+        for idx in range(len(recent)):
+            primary = int(tag_matrix[idx, 0])
+            if primary in tag_last_seen:
+                steps_since[idx] = min((idx - tag_last_seen[primary]) / 50.0, 5.0)
+            else:
+                steps_since[idx] = 5.0
+            tag_last_seen[primary] = idx
+
+        cum_correct = np.cumsum(correct_series)
+        cum_count = np.arange(1, len(recent) + 1, dtype=np.float32)
+        cumulative_acc = (cum_correct / cum_count).astype(np.float32)
+
         # Build vectors from DataFrame
         vecs = []
-        for _, row in recent.iterrows():
-            tags = row.get("tags", [])
-            tag_id = GapSequenceDataset._primary_tag(tags)
-            tag_id = min(max(tag_id, 0), NUM_TAGS - 1)
+        for idx, row in recent.iterrows():
+            padded_tags = tag_matrix[idx]
 
             correct = float(row.get("correct", 0))
-            elapsed = float(row.get("elapsed_time", 15000)) / 15000.0
+            elapsed = float(row.get("elapsed_time", median_elapsed)) / float(median_elapsed)
             elapsed = min(max(elapsed, 0), 5.0)
             changed = float(row.get("changed_answer", 0))
 
@@ -957,8 +1248,14 @@ class PredictionAgent(BaseAgent):
             conf_class = int(row.get("confidence_class", 0))
             conf_class = min(max(conf_class, 0), self._num_conf_classes - 1)
 
-            vecs.append(np.array([tag_id, correct, elapsed, changed, part_id, conf_class],
-                                 dtype=np.float32))
+            vec = np.concatenate([
+                padded_tags,
+                np.array(
+                    [correct, elapsed, changed, part_id, conf_class, steps_since[idx], cumulative_acc[idx]],
+                    dtype=np.float32,
+                ),
+            ])
+            vecs.append(vec)
 
         # Update user buffer
         self._user_sequences[user_id] = vecs[-SEQ_LEN:]
@@ -967,14 +1264,21 @@ class PredictionAgent(BaseAgent):
         if len(vecs) >= SEQ_LEN:
             return np.stack(vecs[-SEQ_LEN:])
 
-        pad = np.zeros((SEQ_LEN - len(vecs), 6), dtype=np.float32)
+        pad = np.zeros((SEQ_LEN - len(vecs), FEATURES_PER_STEP), dtype=np.float32)
         return np.vstack([pad, np.stack(vecs)])
 
     def _load_model(self, path: Path) -> None:
         """Load model weights from disk."""
+        model_cfg = self._config.get(self.model_type, self._config.get("lstm", {}))
+        model_arch_kwargs = {
+            k: v for k, v in model_cfg.items()
+            if k in ("d_model", "nhead", "num_layers", "dim_feedforward",
+                     "hidden_dim", "dropout")
+        }
         model = create_model(
             self.model_type,
             num_conf_classes=self._num_conf_classes,
+            **model_arch_kwargs,
         ).to(DEVICE)
         model.load_state_dict(torch.load(path, map_location=DEVICE, weights_only=True))
         model.eval()

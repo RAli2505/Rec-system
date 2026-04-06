@@ -1,0 +1,26 @@
+{
+  "random": {
+    "precision@10": 0.0013,
+    "recall@10": 0.0007,
+    "ndcg@10": 0.0015,
+    "mrr": 0.004,
+    "coverage": 0.1635,
+    "n_users": 14577
+  },
+  "popularity": {
+    "precision@10": 0.0183,
+    "recall@10": 0.0368,
+    "ndcg@10": 0.0297,
+    "mrr": 0.0495,
+    "coverage": 0.0009,
+    "n_users": 14577
+  },
+  "bpr": {
+    "precision@10": 0.013,
+    "recall@10": 0.0198,
+    "ndcg@10": 0.018,
+    "mrr": 0.0328,
+    "coverage": 0.0398,
+    "n_users": 14577
+  }
+}

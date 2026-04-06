@@ -1,23 +1,22 @@
 """
 Personalization Agent for MARS.
 
-Clusters students into learner types using K-Means on 8 behavioural
-features extracted from interaction history.  The optimal K is chosen
-via Silhouette Score (K = 3..8, expecting 4-6 clusters).
+Stratifies students into 5 learner levels using IRT-based rule-based
+classification by theta (ability estimate).  This replaces K-Means with
+a deterministic, interpretable approach grounded in IRT theory.
 
-Features (8 conceptual, 14 dimensions after one-hot)
------------------------------------------------------
-1. avg_elapsed_time      — mean response time, normalised by global median
-2. accuracy_rate         — fraction of correct answers
-3. changed_answer_rate   — fraction of answers changed before submit
-4. dominant_part         — one-hot (7) of the student's most-practised part
-5. session_frequency     — study sessions per week
-6. avg_questions_per_session — mean questions answered per session
-7. false_confidence_rate — fraction of FALSE_CONFIDENCE class responses
-8. learning_speed        — slope of rolling accuracy over last 50 questions
+5 IRT-based levels (by standard deviation from mean theta)
+----------------------------------------------------------
+1. Low          — θ < μ − 1σ     — foundational support needed
+2. Below Average — μ − 1σ ≤ θ < μ − 0.5σ
+3. Average       — μ − 0.5σ ≤ θ < μ + 0.5σ
+4. Above Average — μ + 0.5σ ≤ θ < μ + 1σ
+5. High          — θ ≥ μ + 1σ    — ready for advanced challenges
 
-Cluster labels are automatically named by interpreting centroid feature
-values (e.g. "Fast Learner", "Struggling", "Steady", "Cramming").
+Advantages over K-Means:
+- Fully deterministic (no random seed dependency)
+- Interpretable thresholds grounded in psychometric theory
+- Stable across runs and datasets
 """
 
 from __future__ import annotations
@@ -29,9 +28,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import StandardScaler
 
 from .base_agent import BaseAgent
 from .confidence_agent import (
@@ -308,45 +304,43 @@ def _name_clusters(centroids_raw: np.ndarray) -> dict[int, str]:
 
 class PersonalizationAgent(BaseAgent):
     """
-    K-Means-based student clustering for personalization.
+    IRT rule-based student stratification for personalization.
 
-    Extracts 8 behavioural features per user, finds the optimal K
-    via Silhouette Score, and assigns each student to a learner archetype.
+    Classifies students into 5 levels based on IRT ability estimate (theta)
+    using standard-deviation thresholds. Deterministic and interpretable.
     """
 
     name = "personalization"
     REQUIRED_COLUMNS = {
-        "train": ["user_id", "timestamp", "correct", "elapsed_time",
-                  "changed_answer", "part_id"],
+        "train": ["user_id", "timestamp", "correct", "elapsed_time"],
+    }
+
+    # IRT-based level definitions (id, name, theta_range description)
+    LEVELS = {
+        0: {"name": "Low",           "label": "Struggling",       "theta_max": -1.0},
+        1: {"name": "Below Average", "label": "Developing",       "theta_max": -0.5},
+        2: {"name": "Average",       "label": "Steady",           "theta_max":  0.5},
+        3: {"name": "Above Average", "label": "Improving",        "theta_max":  1.0},
+        4: {"name": "High",          "label": "Fast Learner",     "theta_max":  float("inf")},
     }
 
     def __init__(self) -> None:
         super().__init__()
-        # Seed fixing
-        _seed = self._config.get("random_state", RANDOM_STATE)
-        from .utils import set_global_seed
-        set_global_seed(_seed)
-
-        # Config-driven parameters
-        k_range_cfg = self._config.get("k_range", [3, 8])
-        self._k_range = range(k_range_cfg[0], k_range_cfg[1] + 1)
-        self._n_init = self._config.get("n_init", 10)
-        self._scaler_type = self._config.get("scaler", "standard")
-        self._random_state = _seed
         self._n_confidence_classes = int(
             self._config.get("n_confidence_classes", DEFAULT_CONFIDENCE_N_CLASSES)
         )
 
-        self.model: KMeans | None = None
-        self.scaler: StandardScaler | None = None
-        self.optimal_k: int = 0
         self._models_dir = Path("models")
-        self._user_features: pd.DataFrame | None = None  # cached feature matrix
-        self._user_clusters: dict[str, int] = {}          # user_id → cluster_id
-        self._cluster_names: dict[int, str] = {}          # cluster_id → name
-        self._cluster_centroids_raw: np.ndarray | None = None  # unscaled centroids
+        self._user_features: pd.DataFrame | None = None
+        self._user_clusters: dict[str, int] = {}
+        self._cluster_names: dict[int, str] = {
+            k: v["label"] for k, v in self.LEVELS.items()
+        }
+        self.optimal_k: int = 5  # fixed: 5 IRT levels
+        self._theta_mean: float = 0.0
+        self._theta_std: float = 1.0
         self._silhouette_scores: dict[int, float] = {}
-        self._inertias: dict[int, float] = {}
+        self._level_counts: dict[int, int] = {}
 
     def set_confidence_schema(self, n_classes: int) -> None:
         """Keep auxiliary confidence-derived features aligned with the active schema."""
@@ -393,93 +387,73 @@ class PersonalizationAgent(BaseAgent):
         k_range: range | None = None,
     ) -> int:
         """
-        Find optimal K via Silhouette Score and fit final K-Means.
+        Stratify users into 5 IRT-based levels using accuracy as theta proxy.
+
+        Uses accuracy_rate from user features as a proxy for IRT theta,
+        then applies standard-deviation thresholds for level assignment.
 
         Parameters
         ----------
         user_features_df : pd.DataFrame
-            One row per user, columns = FEATURE_NAMES (14 dims).
-        k_range : range
-            Values of K to evaluate (default 3..8).
+            One row per user, columns include 'accuracy_rate'.
 
         Returns
         -------
-        int — the optimal K.
+        int — number of levels (always 5).
         """
-        if k_range is None:
-            k_range = self._k_range
-
-        from .utils import set_global_seed
-        set_global_seed(self._random_state)
-
         self._set_processing()
         self._user_features = user_features_df
 
-        X_raw = user_features_df[FEATURE_NAMES].values.astype(np.float64)
+        # Use accuracy_rate as theta proxy (logit-transformed for better spread)
+        if "accuracy_rate" in user_features_df.columns:
+            acc = user_features_df["accuracy_rate"].values.astype(np.float64)
+        else:
+            acc = np.full(len(user_features_df), 0.5)
 
-        # Handle NaN/Inf
-        X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=5.0, neginf=-5.0)
+        # Logit transform: maps [0,1] → (-∞, +∞), approximates theta
+        acc_clipped = np.clip(acc, 0.01, 0.99)
+        theta_proxy = np.log(acc_clipped / (1 - acc_clipped))
 
-        # Scale
-        self.scaler = StandardScaler()
-        X = self.scaler.fit_transform(X_raw)
+        self._theta_mean = float(np.mean(theta_proxy))
+        self._theta_std = float(np.std(theta_proxy))
+        if self._theta_std < 0.01:
+            self._theta_std = 1.0
 
-        # ── Silhouette search ──
-        best_k = min(k_range)
-        best_sil = -1.0
-        self._silhouette_scores = {}
-        self._inertias = {}
+        # Standardize
+        z_theta = (theta_proxy - self._theta_mean) / self._theta_std
 
-        for k in k_range:
-            if k >= len(X):
-                break
-            km = KMeans(
-                n_clusters=k, random_state=self._random_state,
-                n_init=self._n_init, max_iter=300,
-            )
-            labels = km.fit_predict(X)
-            sil = silhouette_score(X, labels)
-            self._silhouette_scores[k] = round(float(sil), 4)
-            self._inertias[k] = round(float(km.inertia_), 2)
-            logger.info("K=%d  silhouette=%.4f  inertia=%.1f", k, sil, km.inertia_)
-            if sil > best_sil:
-                best_sil = sil
-                best_k = k
-
-        self.optimal_k = best_k
-        logger.info("Optimal K=%d (silhouette=%.4f)", best_k, best_sil)
-
-        # ── Fit final model ──
-        self.model = KMeans(
-            n_clusters=best_k, random_state=self._random_state,
-            n_init=self._n_init, max_iter=300,
-        )
-        labels = self.model.fit_predict(X)
-
-        # Inverse-transform centroids for interpretation
-        self._cluster_centroids_raw = self.scaler.inverse_transform(
-            self.model.cluster_centers_
-        )
-
-        # Name each cluster (unique names via relative ranking)
-        self._cluster_names = _name_clusters(self._cluster_centroids_raw)
-
-        # Store per-user assignments
+        # Assign levels based on z-score thresholds
         user_ids = user_features_df.index.tolist()
-        for uid, label in zip(user_ids, labels):
-            self._user_clusters[str(uid)] = int(label)
+        self._level_counts = {k: 0 for k in self.LEVELS}
 
-        # Save model artifacts
-        self._save_model()
+        for uid, z in zip(user_ids, z_theta):
+            level = self._z_to_level(z)
+            self._user_clusters[str(uid)] = level
+            self._level_counts[level] = self._level_counts.get(level, 0) + 1
+
+        # Log distribution
+        for lvl, info in self.LEVELS.items():
+            count = self._level_counts.get(lvl, 0)
+            pct = 100 * count / len(user_ids) if user_ids else 0
+            logger.info(
+                "Level %d [%s]: %d users (%.1f%%)",
+                lvl, info["label"], count, pct,
+            )
 
         logger.info(
-            "Clusters: %s",
-            {cid: f"{name} (n={int((labels == cid).sum())})"
-             for cid, name in self._cluster_names.items()},
+            "IRT stratification: θ_mean=%.3f, θ_std=%.3f, n_users=%d",
+            self._theta_mean, self._theta_std, len(user_ids),
         )
 
         self._set_idle()
-        return best_k
+        return self.optimal_k
+
+    def _z_to_level(self, z: float) -> int:
+        """Map a z-scored theta to one of 5 levels."""
+        for lvl, info in self.LEVELS.items():
+            if z < info["theta_max"]:
+                return lvl
+        return 4  # highest level
 
     # ──────────────────────────────────────────────────────
     # 3. Assign cluster
@@ -494,67 +468,60 @@ class PersonalizationAgent(BaseAgent):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
-        Assign a user to a cluster.
+        Assign a user to an IRT-based level.
 
-        If the user already has cached features, use those.
-        If interactions are provided, compute features on the fly.
-        If only diagnostic/confidence are available (cold start),
-        build a partial feature vector.
-
+        Uses accuracy from interactions or diagnostic theta for classification.
         Returns dict compatible with Orchestrator pipeline.
         """
         self._set_processing()
 
         # Already assigned?
-        if user_id in self._user_clusters and self.model is not None:
+        if user_id in self._user_clusters:
             cid = self._user_clusters[user_id]
-            profile = self._build_profile(user_id, cid)
             self._set_idle()
-            return profile.to_dict()
+            return self._build_level_profile(user_id, cid)
 
-        # Try to build features from interactions
+        # Determine theta proxy
+        accuracy = 0.5  # default
         if interactions is not None and len(interactions) > 0:
-            feat_df = extract_user_features(interactions)
-            if user_id in feat_df.index:
-                vec = feat_df.loc[user_id, FEATURE_NAMES].values.astype(np.float64)
-            else:
-                # User might have different ID format
-                vec = feat_df.iloc[0][FEATURE_NAMES].values.astype(np.float64)
+            accuracy = float(interactions["correct"].mean())
         elif diagnostic is not None:
-            # Cold start: build partial vector from diagnostic + confidence
-            vec = self._cold_start_features(diagnostic, confidence)
-        else:
-            # No data at all — assign to nearest cluster from default vector
-            vec = np.zeros(len(FEATURE_NAMES), dtype=np.float64)
-            vec[FEATURE_NAMES.index("accuracy_rate")] = 0.5
-            vec[FEATURE_NAMES.index("avg_elapsed_time")] = 1.0
-            vec[FEATURE_NAMES.index("session_frequency")] = 1.0
-            vec[FEATURE_NAMES.index("avg_questions_per_session")] = 10.0
+            # Use theta from diagnostic if available
+            theta = diagnostic.get("theta")
+            if theta is not None:
+                z = (float(theta) - self._theta_mean) / self._theta_std
+                level = self._z_to_level(z)
+                self._user_clusters[user_id] = level
+                self._set_idle()
+                return self._build_level_profile(user_id, level)
+            # Fallback: use diagnostic accuracy
+            responses = diagnostic.get("responses", [])
+            if responses:
+                n_correct = sum(1 for r in responses if r.get("correct", False))
+                accuracy = n_correct / len(responses) if responses else 0.5
 
-        if self.model is None or self.scaler is None:
-            self._set_idle()
-            return ClusterProfile(
-                cluster_id=0,
-                cluster_name="Unknown",
-                user_type="Unknown",
-                feature_vector=vec.tolist(),
-                centroid=[],
-                distance_to_centroid=0.0,
-            ).to_dict()
+        # Logit-transform accuracy to theta proxy
+        acc_clipped = np.clip(accuracy, 0.01, 0.99)
+        theta_proxy = np.log(acc_clipped / (1 - acc_clipped))
+        z = (theta_proxy - self._theta_mean) / self._theta_std
+        level = self._z_to_level(z)
+        self._user_clusters[user_id] = level
 
-        # Predict cluster
-        vec = np.nan_to_num(vec, nan=0.0, posinf=5.0, neginf=-5.0)
-        X_scaled = self.scaler.transform(vec.reshape(1, -1))
-        cid = int(self.model.predict(X_scaled)[0])
-        self._user_clusters[user_id] = cid
-
-        # Cache features
-        if self._user_features is not None:
-            self._user_features.loc[user_id] = vec
-
-        profile = self._build_profile(user_id, cid, feature_vector=vec)
         self._set_idle()
-        return profile.to_dict()
+        return self._build_level_profile(user_id, level)
+
+    def _build_level_profile(self, user_id: str, level: int) -> dict[str, Any]:
+        """Build a profile dict for a user at a given IRT level."""
+        info = self.LEVELS.get(level, self.LEVELS[2])
+        return {
+            "cluster_id": level,
+            "cluster_name": info["label"],
+            "user_type": info["label"],
+            "level_name": info["name"],
+            "feature_vector": [],
+            "centroid": [],
+            "distance_to_centroid": 0.0,
+        }
 
     # ──────────────────────────────────────────────────────
     # 4. Personalize (assessment pipeline)
@@ -590,6 +557,7 @@ class PersonalizationAgent(BaseAgent):
 
         return {
             **profile,
+            "level": profile.get("cluster_name", "Steady"),
             "adjustments": adjustments,
         }
 
@@ -663,32 +631,17 @@ class PersonalizationAgent(BaseAgent):
         feature_vector: np.ndarray | None = None,
     ) -> ClusterProfile:
         """Build a ClusterProfile for a user."""
-        name = self._cluster_names.get(cluster_id, f"Cluster_{cluster_id}")
-
-        if feature_vector is None and self._user_features is not None:
-            if user_id in self._user_features.index:
-                feature_vector = self._user_features.loc[user_id].values
-
+        info = self.LEVELS.get(cluster_id, self.LEVELS[2])
+        name = info["label"]
         fv = feature_vector.tolist() if feature_vector is not None else []
-        centroid = (
-            self._cluster_centroids_raw[cluster_id].tolist()
-            if self._cluster_centroids_raw is not None else []
-        )
-
-        # Distance to centroid
-        dist = 0.0
-        if feature_vector is not None and self.scaler is not None and self.model is not None:
-            x_scaled = self.scaler.transform(feature_vector.reshape(1, -1))
-            c_scaled = self.model.cluster_centers_[cluster_id]
-            dist = float(np.linalg.norm(x_scaled - c_scaled))
 
         return ClusterProfile(
             cluster_id=cluster_id,
             cluster_name=name,
             user_type=name,
             feature_vector=fv,
-            centroid=centroid,
-            distance_to_centroid=dist,
+            centroid=[],
+            distance_to_centroid=0.0,
         )
 
     def _cold_start_features(
@@ -790,47 +743,38 @@ class PersonalizationAgent(BaseAgent):
         return adj
 
     def _save_model(self) -> None:
-        """Save model artifacts to disk."""
-        import pickle
+        """Save IRT stratification parameters to disk."""
+        import json
 
         self._models_dir.mkdir(parents=True, exist_ok=True)
         artifacts = {
-            "model": self.model,
-            "scaler": self.scaler,
-            "optimal_k": self.optimal_k,
-            "cluster_names": self._cluster_names,
-            "centroids_raw": self._cluster_centroids_raw,
-            "silhouette_scores": self._silhouette_scores,
-            "inertias": self._inertias,
+            "method": "irt_rule_based",
+            "n_levels": self.optimal_k,
+            "theta_mean": self._theta_mean,
+            "theta_std": self._theta_std,
+            "level_counts": self._level_counts,
+            "levels": {str(k): v for k, v in self.LEVELS.items()},
         }
-        path = self._models_dir / "personalization_kmeans.pkl"
-        with open(path, "wb") as f:
-            pickle.dump(artifacts, f)
-        logger.info("Saved personalization model → %s", path)
+        path = self._models_dir / "personalization_irt.json"
+        with open(path, "w") as f:
+            json.dump(artifacts, f, indent=2, default=str)
+        logger.info("Saved IRT stratification → %s", path)
 
     def load_model(self) -> bool:
-        """Load model artifacts from disk. Returns True if successful."""
-        import pickle
+        """Load IRT stratification parameters from disk."""
+        import json
 
-        path = self._models_dir / "personalization_kmeans.pkl"
+        path = self._models_dir / "personalization_irt.json"
         if not path.exists():
             return False
-        with open(path, "rb") as f:
-            artifacts = pickle.load(f)
-        self.model = artifacts["model"]
-        self.scaler = artifacts["scaler"]
-        self.optimal_k = artifacts["optimal_k"]
-        self._cluster_names = artifacts["cluster_names"]
-        self._cluster_centroids_raw = artifacts["centroids_raw"]
-        self._silhouette_scores = artifacts["silhouette_scores"]
-        self._inertias = artifacts["inertias"]
-        logger.info("Loaded personalization model (K=%d)", self.optimal_k)
+        with open(path, "r") as f:
+            artifacts = json.load(f)
+        self._theta_mean = artifacts["theta_mean"]
+        self._theta_std = artifacts["theta_std"]
+        self._level_counts = {int(k): v for k, v in artifacts.get("level_counts", {}).items()}
+        logger.info("Loaded IRT stratification (θ_mean=%.3f, θ_std=%.3f)", self._theta_mean, self._theta_std)
         return True
 
     @property
     def silhouette_scores(self) -> dict[int, float]:
         return self._silhouette_scores
-
-    @property
-    def inertias(self) -> dict[int, float]:
-        return self._inertias
