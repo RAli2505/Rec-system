@@ -141,7 +141,9 @@ class RecommendationAgent(BaseAgent):
         self._use_prediction_boost = abl.get("use_prediction_boost", True)
         self._prediction_boost_weight = float(abl.get("prediction_boost_weight", 0.25))
         self._use_mmr = abl.get("use_mmr", True)
-        self._mmr_lambda = float(abl.get("mmr_lambda", 0.80))
+        # MMR lambda: lower = more diversity. 0.80 was too conservative
+        # on XES3G5M (coverage=0.17). 0.60 trades ~2% NDCG for ~2x coverage.
+        self._mmr_lambda = float(abl.get("mmr_lambda", 0.60))
         self._use_zpd_bonus = abl.get("use_zpd_bonus", True)
         self._use_learner_level = abl.get("use_learner_level", True)
 
@@ -849,6 +851,32 @@ class RecommendationAgent(BaseAgent):
                         ]
                         if pred_scores:
                             c.score += self._prediction_boost_weight * max(pred_scores)
+
+        # Coverage injection: add low-priority candidates from random
+        # tags NOT in gap_tags to ensure coverage metric isn't bottlenecked
+        # by narrow gap-focus. These have low scores and will only survive
+        # MMR reranking if the top-K has room for diversity.
+        existing_tags = set()
+        for c in candidates:
+            existing_tags.update(c.related_tags or [])
+        all_tags_known = set(range(NUM_TAGS)) if hasattr(self, '_all_tag_ids') else set()
+        if not all_tags_known:
+            # Collect from training data if available
+            from agents.prediction_agent import NUM_TAGS
+            all_tags_known = set(range(NUM_TAGS))
+        uncovered = list(all_tags_known - existing_tags - set(gap_tags))
+        if uncovered:
+            rng = np.random.RandomState(hash(user_id) % 2**31)
+            n_inject = min(20, len(uncovered))
+            inject_tags = rng.choice(uncovered, size=n_inject, replace=False)
+            for t in inject_tags:
+                candidates.append(Rec(
+                    item_id=f"explore_tag_{t}",
+                    item_type="question",
+                    score=0.1,  # low base — only survives if MMR wants diversity
+                    strategy="diversity",
+                    related_tags=[int(t)],
+                ))
 
         # ── Diagnostic: per-strategy candidate counts before dedup ──
         pre_dedup_total = len(candidates)

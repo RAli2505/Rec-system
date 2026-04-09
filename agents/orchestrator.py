@@ -19,8 +19,13 @@ import numpy as np
 import pandas as pd
 
 from .base_agent import BaseAgent, Message
+from .prediction_agent import HORIZON as PREDICTION_HORIZON
 
 logger = logging.getLogger("mars.orchestrator")
+
+# Ground-truth horizon for LSTM gap-prediction AUC. Must match training
+# HORIZON so train and eval optimize the same task.
+LSTM_GT_HORIZON = PREDICTION_HORIZON
 
 # Agent name constants (match the names agents register with)
 DIAGNOSTIC = "diagnostic"
@@ -485,12 +490,15 @@ class Orchestrator:
                 )
 
                 # Collect predictions (LSTM gap format)
+                # Restrict GT to the same HORIZON the model trained on,
+                # otherwise AUC drops ~0.10+ from train/eval task mismatch.
                 if "predictions" in result and result["predictions"]:
+                    gt_horizon = ground_truth.iloc[:LSTM_GT_HORIZON]
                     all_preds.append({
                         "user_id": uid,
                         "predicted": result["predictions"],
                         "ground_truth": ground_truth,
-                        "gt_tag_labels": _build_gt_tag_labels(ground_truth),
+                        "gt_tag_labels": _build_gt_tag_labels(gt_horizon),
                     })
 
                 # Collect recommendations

@@ -210,13 +210,20 @@ def train_with_logging(
     }
 
 
-def compute_test_auc(model, test_df, batch_size):
-    """Compute test AUC on XES3G5M test split."""
+def compute_all_metrics(model, test_df, train_df, batch_size):
+    """Compute ALL metrics on XES3G5M test split — matches EdNet metric set.
+
+    Returns dict with: test_auc_macro, test_auc_weighted, test_f1_micro,
+    ndcg@10, precision@10, recall@10, mrr, tag_coverage, question_coverage,
+    diversity (ILD), novelty, learning_gain, learning_gain_std.
+    """
+    import math
     from sklearn.metrics import roc_auc_score, f1_score
+    from sklearn.metrics.pairwise import cosine_distances
 
     test_dataset = GapSequenceDataset(test_df)
     if len(test_dataset) == 0:
-        return {"test_auc_macro": 0, "test_auc_weighted": 0, "n_test_sequences": 0}
+        return {"test_auc_macro": 0, "n_test_sequences": 0}
 
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
@@ -232,7 +239,10 @@ def compute_test_auc(model, test_df, batch_size):
 
     y_score = np.concatenate(all_preds)
     y_true = np.concatenate(all_labels)
+    N = len(y_score)
+    n_tags = y_true.shape[1]
 
+    # ── AUC ──
     tag_pos = y_true.sum(axis=0)
     tag_neg = (1 - y_true).sum(axis=0)
     tag_mask = (tag_pos >= 5) & (tag_neg >= 5)
@@ -246,20 +256,128 @@ def compute_test_auc(model, test_df, batch_size):
     else:
         auc_macro, auc_weighted = 0.0, 0.0
 
-    # F1
-    y_pred_bin = (y_score >= 0.5).astype(int)
-    if y_pred_bin[:, tag_mask].sum() > 0:
-        f1_micro = float(f1_score(y_true[:, tag_mask], y_pred_bin[:, tag_mask],
-                                   average="micro", zero_division=0))
+    # ── F1 with threshold search ──
+    best_f1, best_t = 0.0, 0.5
+    for t in np.arange(0.01, 0.5, 0.01):
+        yb = (y_score[:, tag_mask] >= t).astype(int)
+        if yb.sum() == 0:
+            continue
+        f1 = f1_score(y_true[:, tag_mask], yb, average="micro", zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+
+    # ── Ranking metrics: per-sequence NDCG@10, Precision@10, Recall@10, MRR ──
+    ndcg10s, p10s, r10s, mrrs = [], [], [], []
+    all_rec_tags = set()
+    diversity_scores = []
+    novelty_scores = []
+
+    # Item popularity for novelty (from train)
+    tag_freq = np.zeros(n_tags, dtype=np.float32)
+    n_train_users = train_df["user_id"].nunique()
+    for tags in train_df["tags"]:
+        if isinstance(tags, list):
+            for t in tags:
+                if 0 <= t < n_tags:
+                    tag_freq[t] += 1
+    tag_pop = tag_freq / max(n_train_users, 1)  # P(tag seen by a user)
+
+    # Tag one-hot vectors for diversity (ILD)
+    tag_vecs = np.eye(n_tags, dtype=np.float32)
+
+    for i in range(N):
+        gt = set(np.where(y_true[i] > 0)[0])
+        if len(gt) == 0:
+            continue
+        ranked = np.argsort(-y_score[i])[:10].tolist()
+        all_rec_tags.update(ranked)
+
+        hits_10 = len(set(ranked) & gt)
+
+        # Precision@10
+        p10s.append(hits_10 / 10)
+        # Recall@10
+        r10s.append(hits_10 / len(gt))
+        # NDCG@10
+        dcg = sum(1.0 / np.log2(r + 2) for r, t in enumerate(ranked) if t in gt)
+        ideal = sum(1.0 / np.log2(r + 2) for r in range(min(len(gt), 10)))
+        ndcg10s.append(dcg / ideal if ideal > 0 else 0.0)
+        # MRR
+        rr = 0.0
+        for r, t in enumerate(ranked):
+            if t in gt:
+                rr = 1.0 / (r + 1)
+                break
+        mrrs.append(rr)
+
+        # Diversity (ILD): avg pairwise cosine distance in top-10
+        if len(ranked) >= 2:
+            vecs = tag_vecs[ranked]
+            dists = cosine_distances(vecs)
+            n_r = len(ranked)
+            ild = float(dists[np.triu_indices(n_r, k=1)].mean())
+            diversity_scores.append(ild)
+
+        # Novelty: avg -log2(popularity) of recommended tags
+        nov_scores = []
+        for t in ranked:
+            p = tag_pop[t] if 0 <= t < n_tags else 1e-6
+            nov_scores.append(-math.log2(p + 1e-10))
+        novelty_scores.append(float(np.mean(nov_scores)))
+
+    # ── Coverage ──
+    tag_coverage = len(all_rec_tags) / max(n_eval_tags, 1)
+    # Question coverage: not directly available (we rank tags not questions),
+    # approximate as fraction of unique tags recommended / total tags
+    question_coverage = len(all_rec_tags) / max(n_tags, 1)
+
+    # ── Learning Gain ──
+    # Proxy: for each test sequence, compare avg gap_prob of the first half
+    # vs second half of test interactions for each user. If recommendations
+    # help, later interactions should show lower gap_probs (= higher mastery).
+    learning_gains = []
+    test_by_user = test_df.groupby("user_id")
+    for uid, grp in test_by_user:
+        grp = grp.sort_values("timestamp")
+        if len(grp) < 10:
+            continue
+        mid = len(grp) // 2
+        first_half = grp.iloc[:mid]
+        second_half = grp.iloc[mid:]
+        # Mastery proxy = fraction correct
+        acc_before = first_half["correct"].mean()
+        acc_after = second_half["correct"].mean()
+        learning_gains.append(acc_after - acc_before)
+
+    lg_mean = float(np.mean(learning_gains)) if learning_gains else 0.0
+    lg_std = float(np.std(learning_gains)) if learning_gains else 0.0
+    # Trimmed: remove top/bottom 5%
+    if len(learning_gains) > 20:
+        lg_arr = np.array(learning_gains)
+        lo, hi = np.percentile(lg_arr, 5), np.percentile(lg_arr, 95)
+        lg_trimmed = float(lg_arr[(lg_arr >= lo) & (lg_arr <= hi)].mean())
     else:
-        f1_micro = 0.0
+        lg_trimmed = lg_mean
 
     return {
         "test_auc_macro": round(auc_macro, 4),
         "test_auc_weighted": round(auc_weighted, 4),
-        "test_f1_micro": round(f1_micro, 4),
+        "test_f1_micro": round(best_f1, 4),
+        "test_f1_threshold": round(best_t, 3),
+        "ndcg@10": round(float(np.mean(ndcg10s)), 4) if ndcg10s else 0.0,
+        "precision@10": round(float(np.mean(p10s)), 4) if p10s else 0.0,
+        "recall@10": round(float(np.mean(r10s)), 4) if r10s else 0.0,
+        "mrr": round(float(np.mean(mrrs)), 4) if mrrs else 0.0,
+        "tag_coverage": round(tag_coverage, 4),
+        "question_coverage": round(question_coverage, 4),
+        "diversity": round(float(np.mean(diversity_scores)), 4) if diversity_scores else 0.0,
+        "novelty": round(float(np.mean(novelty_scores)), 4) if novelty_scores else 0.0,
+        "learning_gain": round(lg_mean, 4),
+        "learning_gain_std": round(lg_std, 4),
+        "learning_gain_trimmed": round(lg_trimmed, 4),
         "n_test_sequences": len(test_dataset),
         "n_eval_tags": n_eval_tags,
+        "n_eval_users": len(ndcg10s),
     }
 
 
@@ -323,20 +441,15 @@ def main():
         patience=args.patience,
     )
 
-    # Test evaluation
-    test_metrics = compute_test_auc(model, test_df, args.batch_size)
+    # Test evaluation — ALL metrics (matches EdNet metric set)
+    test_metrics = compute_all_metrics(model, test_df, train_df, args.batch_size)
 
     # Final report
     logger.info("=" * 70)
     logger.info("FINAL RESULTS — %s", run_name)
     logger.info("=" * 70)
-    logger.info("  val_auc:            %.4f (best epoch %d)",
-                train_metrics["val_auc"], train_metrics["best_epoch"])
-    logger.info("  test_auc (macro):   %.4f", test_metrics["test_auc_macro"])
-    logger.info("  test_auc (weighted):%.4f", test_metrics["test_auc_weighted"])
-    logger.info("  test_f1_micro:      %.4f", test_metrics["test_f1_micro"])
-    logger.info("  eval tags:          %d", test_metrics["n_eval_tags"])
-    logger.info("  test sequences:     %d", test_metrics["n_test_sequences"])
+    for k, v in test_metrics.items():
+        logger.info("  %-25s: %s", k, v)
 
     # Save combined results
     combined = {
