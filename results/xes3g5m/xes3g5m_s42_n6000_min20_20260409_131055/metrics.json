@@ -1,0 +1,20 @@
+{
+  "run_name": "xes3g5m_s42_n6000_min20_20260409_131055",
+  "dataset": "XES3G5M",
+  "model_type": "transformer",
+  "n_students": 6000,
+  "min_interactions": 20,
+  "seed": 42,
+  "patience": 5,
+  "lr": 0.0005,
+  "batch_size": 32,
+  "best_epoch": 10,
+  "val_auc": 0.9647,
+  "val_loss": 0.1013,
+  "total_epochs": 15,
+  "test_auc_macro": 0.9642,
+  "test_auc_weighted": 0.956,
+  "test_f1_micro": 0.2169,
+  "n_test_sequences": 21298,
+  "n_eval_tags": 277
+}

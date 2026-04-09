@@ -1,0 +1,13 @@
+{
+  "test_auc_macro": 0.9303,
+  "test_auc_weighted": 0.9234,
+  "test_f1_micro": 0.1701,
+  "test_f1_threshold": 0.49,
+  "ndcg@10": 0.4334,
+  "precision@10": 0.1688,
+  "recall@10": 0.5939,
+  "mrr": 0.4513,
+  "coverage": 0.8592,
+  "n_eval_users": 17339,
+  "n_eval_tags": 277
+}
