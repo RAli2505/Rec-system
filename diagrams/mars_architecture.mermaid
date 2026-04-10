@@ -6,9 +6,9 @@
 
 graph TD
     %% ── Input Layer ──────────────────────────────────
-    DS["<b>EdNet KT2 Dataset</b><br/>784K students, 131M+ interactions"]
-    PP["<b>Data Preprocessing</b><br/>Feature Engineering"]
-    SP["<b>Chronological Split</b><br/>70% Train / 15% Val / 15% Test"]
+    DS["<b>Datasets</b><br/>EdNet KT2 (20K users, TOEIC)<br/>XES3G5M (6K users, Math)"]
+    PP["<b>Data Preprocessing</b><br/>Feature Engineering + Confidence Synthesis"]
+    SP["<b>User-Level Split</b><br/>70% Train / 15% Val / 15% Test"]
 
     DS --> PP --> SP
 
@@ -25,25 +25,25 @@ graph TD
 
         subgraph ROW1 [" "]
             direction LR
-            DIAG["<b>DiagnosticAgent</b><br/><i>IRT 3PL + CAT</i><br/>θ estimation"]
-            CONF["<b>ConfidenceAgent</b><br/><i>XGBoost → 6-class</i><br/>confidence classification"]
+            DIAG["<b>DiagnosticAgent</b><br/><i>IRT 3PL + CAT</i><br/>θ ability estimation"]
+            CONF["<b>ConfidenceAgent</b><br/><i>Rule-based 6-class</i><br/>behavioral confidence"]
         end
 
         subgraph ROW2 [" "]
             direction LR
-            KG["<b>KnowledgeGraphAgent</b><br/><i>GraphSAGE embeddings</i><br/>+ Prerequisite graph"]
-            PRED["<b>PredictionAgent</b><br/><i>LSTM seq-to-set</i><br/>→ 293-dim gap vector"]
+            KG["<b>KnowledgeGraphAgent</b><br/><i>GraphSAGE embeddings</i><br/>+ Prerequisite mining"]
+            PRED["<b>PredictionAgent</b><br/><i>SAINT Transformer 4L/256d</i><br/>→ 293-dim gap vector"]
         end
 
-        REC["<b>RecommendationAgent</b><br/><i>Thompson Sampling + LambdaMART</i><br/>12 ranking features"]
-        PERS["<b>PersonalizationAgent</b><br/><i>K-Means (K=6)</i><br/>+ adaptive params"]
+        REC["<b>RecommendationAgent</b><br/><i>Thompson Sampling + Weighted Linear</i><br/>6 features + MMR diversity"]
+        PERS["<b>PersonalizationAgent</b><br/><i>IRT rule-based 5-level</i><br/>learner stratification"]
 
         %% ── Data flow arrows ──
         DIAG -->|"θ (ability)"| KG
         DIAG -->|"θ"| REC
         CONF -->|"confidence_class"| PRED
         CONF -->|"conf_class"| REC
-        KG -->|"prerequisites & gaps"| REC
+        KG -->|"gap_tags, prereq_map<br/>mastered_tags"| REC
         PRED -->|"gap_probs[293]"| REC
         REC -->|"ranked items"| PERS
     end
@@ -51,7 +51,7 @@ graph TD
     SP --> ORCH
 
     %% ── Output Layer ────────────────────────────────
-    OUT["<b>Personalized Recommendation List</b><br/>Ranked items with explanations"]
+    OUT["<b>Personalized Recommendation List</b><br/>Top-K ranked items with explanations"]
     PERS --> OUT
 
     %% ── Styles ──────────────────────────────────────

@@ -1,0 +1,20 @@
+Statistic,Value
+Dataset,XES3G5M
+Domain,Chinese Math
+Total students (sampled),"6,000"
+Min interactions per student,20
+Total interactions,"2,134,487"
+Avg interactions/student,355.7
+Unique concepts (KC),858
+Unique questions,"7,373"
+Question types,"Fill-in (6142), MCQ (1510)"
+Train split (users),"4,200 (70%)"
+Validation split (users),900 (15%)
+Test split (users),900 (15%)
+Train interactions,"1,500,899"
+Val interactions,"317,716"
+Test interactions,"315,872"
+Train sequences,"102,106"
+Val sequences,"21,481"
+Test sequences,"21,298"
+Split method,User-level random

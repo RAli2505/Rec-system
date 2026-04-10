@@ -1,0 +1,17 @@
+Algorithm 1: MARS Assessment Pipeline
+Input: user_id, interactions
+Output: ranked_recommendations (top-K)
+
+1:  theta, SE <- DiagnosticAgent.run_assessment(user_id, interactions)
+2:  conf_classes <- ConfidenceAgent.classify_batch(interactions)
+3:  kg_profile <- KGAgent.update_user_profile(user_id, interactions)
+4:  interactions.confidence_class <- conf_classes
+5:  gap_probs[N_tags] <- PredictionAgent.predict_gaps(user_id, interactions)
+6:  level <- PersonalizationAgent.assign_level(theta)
+7:  candidates <- KB(kg_profile) + CB(gap_tags) + CF(user_id)
+8:  for each c in candidates:
+9:    score(c) <- w1*gap_rel + w2*diff_match + w3*recency
+10:               + w4*strategy + w5*coverage + w6*causal
+11:   score(c) *= prereq_readiness(c) * zpd_filter(c)
+12: ranked <- MMR_rerank(candidates, lambda=0.60, K=10)
+13: return ranked

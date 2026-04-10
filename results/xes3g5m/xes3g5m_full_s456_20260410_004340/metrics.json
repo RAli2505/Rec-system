@@ -1,0 +1,71 @@
+{
+  "run_name": "xes3g5m_full_s456_20260410_004340",
+  "dataset": "XES3G5M",
+  "pipeline": "full_multi_agent",
+  "seed": 456,
+  "n_students": 6000,
+  "min_interactions": 20,
+  "agent_metrics": {
+    "diagnostic": {
+      "n_items": 6317,
+      "time_s": 9.5
+    },
+    "confidence": {
+      "method": "rule_based",
+      "cv_f1_macro_mean": 1.0,
+      "cv_f1_macro_std": 0.0,
+      "full_f1_macro": 1.0,
+      "n_samples": 1490789,
+      "n_classes": 6,
+      "class_distribution": {
+        "SOLID": 94092,
+        "UNSURE_CORRECT": 1093062,
+        "FALSE_CONFIDENCE": 23900,
+        "CLEAR_GAP": 279735
+      },
+      "time_s": 0.4
+    },
+    "knowledge_graph": {
+      "n_nodes": 8524,
+      "n_edges": 25746,
+      "time_s": 255.8
+    },
+    "prediction": {
+      "best_epoch": 10,
+      "val_auc": 0.9677,
+      "val_loss": 0.0984,
+      "total_epochs": 15,
+      "time_s": 2500.6
+    },
+    "recommendation": {
+      "time_s": 39.6
+    },
+    "personalization": {
+      "n_levels": 5,
+      "time_s": 1.6
+    }
+  },
+  "eval_metrics": {
+    "lstm_f1_micro": 0.1526,
+    "lstm_threshold": 0.5,
+    "lstm_f1_macro": 0.0895,
+    "lstm_auc": 0.9161,
+    "lstm_auc_weighted": 0.9034,
+    "precision@10": 0.6916,
+    "recall@10": 0.0629,
+    "ndcg@10": 0.725,
+    "mrr": 0.905,
+    "coverage": 0.4141,
+    "tag_coverage": 0.4141,
+    "question_coverage": 0.0182,
+    "eval_time_sec": 38.5,
+    "n_users_evaluated": 900,
+    "learning_gain_raw": 0.0341,
+    "learning_gain_raw_std": 0.0981,
+    "learning_gain": 0.0014,
+    "learning_gain_std": 0.0909,
+    "learning_gain_trimmed": 0.0001
+  },
+  "eval_time_s": 38.5,
+  "total_time_s": 2875.7
+}

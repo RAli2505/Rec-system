@@ -67,40 +67,20 @@ def load_xes3g5m(
         if valid_count < min_interactions:
             continue
 
-        # Parse valid timestamps for elapsed_time computation
-        valid_indices = []
-        valid_ts = []
         for i in range(n):
-            r = responses[i].strip()
-            ts = timestamps[i].strip()
-            if r in ("-1", "") or ts in ("-1", ""):
-                continue
-            valid_indices.append(i)
-            valid_ts.append(int(ts))
-
-        for vi_pos, i in enumerate(valid_indices):
             r = responses[i].strip()
             ts = timestamps[i].strip()
             q = questions[i].strip()
             c = concepts[i].strip()
-
-            # Synthesize elapsed_time from consecutive timestamps:
-            # elapsed[i] = timestamp[i+1] - timestamp[i]
-            # Cap at 300000ms (5 min) — anything longer is a session break.
-            # Last interaction gets median fallback (15000ms).
-            if vi_pos + 1 < len(valid_ts):
-                elapsed = valid_ts[vi_pos + 1] - valid_ts[vi_pos]
-                elapsed = max(1000, min(elapsed, 300000))  # clamp [1s, 5min]
-            else:
-                elapsed = 15000  # last interaction: median fallback
-
+            if r in ("-1", "") or ts in ("-1", ""):
+                continue
             rows.append({
                 "user_id": uid,
                 "timestamp": int(ts),
                 "question_id": f"q{q}",
                 "tags": [int(c)] if c.isdigit() else [0],
                 "correct": int(r),
-                "elapsed_time": float(elapsed),
+                "elapsed_time": 15000.0,  # not available in XES3G5M
                 "changed_answer": 0,      # not available in XES3G5M
                 "part_id": 1,             # single domain (math)
             })

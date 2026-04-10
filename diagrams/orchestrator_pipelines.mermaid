@@ -1,7 +1,7 @@
 sequenceDiagram
     autonumber
 
-    participant S as 🎓 Student
+    participant S as Student
     participant O as Orchestrator
     participant D as DiagnosticAgent
     participant C as ConfidenceAgent
@@ -12,52 +12,58 @@ sequenceDiagram
 
     %% ── Pipeline 1: COLD-START ──────────────────────
     rect rgb(214, 234, 248)
-        Note over S,PR: Pipeline 1: COLD-START (new student, < 5 answers)
+        Note over S,PR: Pipeline 1: COLD-START (new student)
         S->>O: new_student(profile)
         O->>D: estimate_initial_theta(prior=0.0)
-        D-->>O: θ_initial, SE
-        O->>K: get_prerequisites(all_tags)
-        K-->>O: prerequisite_graph
-        O->>R: recommend(θ, prerequisites, strategy="explore")
+        D-->>O: theta_initial, SE
+        O->>K: cold_start(diagnostic)
+        K-->>O: mastered_tags, gap_tags, prereq_map, recommendations
+        O->>R: recommend(theta, kg_profile, strategy="explore")
         R-->>O: ranked_items (exploration-heavy)
         O-->>S: initial_items
     end
 
-    Note over S,PR: Student answers ≥ 5 questions...
+    Note over S,PR: Student completes interactions...
 
     %% ── Pipeline 2: ASSESSMENT ──────────────────────
     rect rgb(213, 245, 227)
-        Note over S,PR: Pipeline 2: ASSESSMENT (≥ 5 answers)
-        S->>O: submit_answers(responses)
+        Note over S,PR: Pipeline 2: ASSESSMENT (main pipeline)
+        S->>O: submit_interactions(responses)
 
-        O->>D: update_theta(responses)
-        Note right of D: CAT + Bayesian update
-        D-->>O: θ_updated, SE, tag_mastery
+        O->>D: run_assessment(user_id, interactions)
+        Note right of D: IRT 3PL + CAT<br/>theta, SE estimation
+        D-->>O: theta, SE, responses
 
-        O->>C: classify(responses, θ)
-        C-->>O: confidence_classes[6]
+        O->>C: classify_batch(interactions)
+        C-->>O: confidence_classes[6]<br/>(SOLID/UNSURE/GAP/...)
 
-        O->>K: identify_gaps(tag_mastery, prerequisites)
-        K-->>O: knowledge_gaps, missing_prereqs
+        O->>K: update_user_profile(user_id, interactions)
+        Note right of K: Per-tag accuracy tracking<br/>Prerequisite readiness
+        K-->>O: mastered_tags, gap_tags, prereq_map
 
-        O->>P: predict_future_gaps(sequence)
-        P-->>O: predicted_gaps[293]
+        O->>P: predict_gaps(user_id, recent=prior_history+context)
+        Note right of P: SAINT Transformer<br/>SEQ_LEN=100 window<br/>293-dim gap_probs
+        P-->>O: gap_probabilities[293]
 
-        O->>R: recommend(θ, gaps, confidence, predictions)
-        Note right of R: Thompson Sampling<br/>+ LambdaMART re-ranking
-        R-->>O: ranked_items
+        O->>PR: personalize(user_id, diagnostic, confidence)
+        PR-->>O: learner_level (5 levels)
 
-        O-->>S: personalized_items
+        O->>R: recommend(theta, kg_profile, predictions, learner_level)
+        Note right of R: Thompson Sampling candidates<br/>6-feature weighted scoring<br/>× prereq_readiness × ZPD<br/>MMR diversity (lambda=0.60)
+        R-->>O: ranked_items[top-10]
+
+        O-->>S: personalized_recommendations
     end
 
     %% ── Pipeline 3: CONTINUOUS ──────────────────────
     rect rgb(253, 235, 208)
-        Note over S,PR: Pipeline 3: CONTINUOUS (every N interactions)
-        loop Every N interactions
-            O->>PR: cluster(student_features)
-            PR-->>O: cluster_id, cluster_params
-            O->>O: adjust_agent_params(cluster_params)
-            Note over O: Adapt difficulty, strategy<br/>weights, exploration rate
+        Note over S,PR: Pipeline 3: CONTINUOUS (per interaction)
+        loop Every interaction
+            S->>O: new_interaction(answer)
+            O->>P: update_state(user_id, interaction)
+            P-->>O: updated_gaps, top_risks
+            O->>R: re_rank(user_id, predictions)
+            R-->>O: adjusted_items
+            O-->>S: next_recommendation
         end
-        Note over O,R: Continue Assessment Pipeline with adapted parameters
     end

@@ -4,27 +4,27 @@
 }}}%%
 
 graph TD
-    RAW["<b>EdNet Raw Data</b><br/><i>784K students, 131M+ interactions</i>"]
-    SAMPLE["<b>User Sampling</b><br/><i>sample_users=1000 → filter min_answers ≥ 10</i>"]
-    PREP["<b>Preprocessing & Feature Engineering</b><br/><i>elapsed_time clip [1s, 300s] · session gap 30 min · 16 features</i>"]
-    SPLIT["<b>Chronological Split (per student)</b><br/><i>first 70% → Train / next 15% → Val / last 15% → Test</i>"]
+    RAW["<b>Raw Datasets</b><br/><i>EdNet KT2: 784K students, 131M+ interactions (TOEIC)</i><br/><i>XES3G5M: 33K students, 5.1M interactions (Math)</i>"]
+    SAMPLE["<b>User Sampling</b><br/><i>EdNet: sample_users=1000, min_answers≥10</i><br/><i>XES3G5M: sample_users=6000, min_interactions≥20</i>"]
+    PREP["<b>Preprocessing & Feature Engineering</b><br/><i>elapsed_time (EdNet: real / XES3G5M: from timestamps)</i><br/><i>session gap 30 min · confidence_class · tags parsing</i>"]
+    SPLIT["<b>User-Level Split</b><br/><i>70% users → Train / 15% → Val / 15% → Test</i><br/><i>Full history per user (no temporal slicing)</i>"]
 
     RAW --> SAMPLE --> PREP --> SPLIT
 
-    TRAIN["<b>Train Data</b><br/>70% · 32,754 interactions"]
-    VAL["<b>Validation Data</b><br/>15%"]
-    TEST["<b>Test Data</b><br/>15%"]
+    TRAIN["<b>Train Data</b><br/>EdNet: 1.7M interactions<br/>XES3G5M: 1.5M interactions"]
+    VAL["<b>Validation Data</b><br/>15% users"]
+    TEST["<b>Test Data</b><br/>15% users"]
 
     SPLIT --> TRAIN
     SPLIT --> VAL
     SPLIT --> TEST
 
     DIAG["DiagnosticAgent<br/><i>IRT 3PL calibration</i>"]
-    CONF["ConfidenceAgent<br/><i>XGBoost 6-class training</i>"]
+    CONF["ConfidenceAgent<br/><i>Rule-based 6-class</i>"]
     KG["KnowledgeGraphAgent<br/><i>GraphSAGE + prerequisite mining</i>"]
-    PRED["PredictionAgent<br/><i>LSTM seq-to-set training</i>"]
-    REC["RecommendationAgent<br/><i>TS priors + LambdaMART fit</i>"]
-    PERS["PersonalizationAgent<br/><i>K-Means clustering (K=6)</i>"]
+    PRED["PredictionAgent<br/><i>SAINT Transformer 4L/256d</i>"]
+    REC["RecommendationAgent<br/><i>Thompson Sampling + Weighted Linear + MMR</i>"]
+    PERS["PersonalizationAgent<br/><i>IRT rule-based 5-level</i>"]
 
     TRAIN --> DIAG
     TRAIN --> CONF
@@ -33,13 +33,13 @@ graph TD
     TRAIN --> REC
     TRAIN --> PERS
 
-    HP["Hyperparameter tuning"]
-    EVAL["<b>Final Evaluation</b><br/><i>5 seeds · 16 metrics</i>"]
+    HP["Hyperparameter tuning<br/><i>patience=5, lr=5e-4, batch=32</i>"]
+    EVAL["<b>Final Evaluation</b><br/><i>5 seeds · 15 metrics · Orchestrator batch_eval</i>"]
 
     VAL --> HP
     TEST --> EVAL
 
-    LEAK["⚠️ All agents trained on<br/>train split only (no data leakage)"]
+    LEAK["No data leakage:<br/>All agents trained on train split only<br/>train_user_ids passed to KG prerequisites"]
 
     classDef rawBox fill:#AED6F1,stroke:#5DADE2,stroke-width:2px
     classDef procBox fill:#D5DBDB,stroke:#ABB2B9,stroke-width:1px
@@ -48,7 +48,7 @@ graph TD
     classDef valBox fill:#FCF3CF,stroke:#F1C40F,stroke-width:1px
     classDef testBox fill:#FADBD8,stroke:#E74C3C,stroke-width:1px
     classDef agentBox fill:#EBF0F5,stroke:#5B7BA0,stroke-width:1px
-    classDef warnBox fill:#FEF9E7,stroke:#E74C3C,stroke-width:1px,color:#E74C3C
+    classDef warnBox fill:#D5F5E3,stroke:#27AE60,stroke-width:1px,color:#27AE60
 
     class RAW rawBox
     class SAMPLE,PREP procBox
