@@ -72,9 +72,9 @@ for mi,(label,key) in enumerate(mets):
         ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=6.5)
 ax.set_xticks(x); ax.set_xticklabels(methods)
 ax.get_xticklabels()[-1].set_fontweight('bold')
-ax.set_ylabel('Score'); ax.legend(loc='upper left', ncol=4, framealpha=0.9); ax.set_ylim(0,1.1)
-fig.savefig(FDIR/'fig6_mars_vs_baselines.png', dpi=300)
-fig.savefig(FDIR/'fig6_mars_vs_baselines.pdf')
+ax.set_ylabel('Score'); ax.legend(loc='upper left', ncol=4, framealpha=0.9, bbox_to_anchor=(0, 1.15)); ax.set_ylim(0,1.15)
+fig.savefig(FDIR/'fig6_mars_vs_baselines.png', dpi=300, bbox_inches='tight')
+fig.savefig(FDIR/'fig6_mars_vs_baselines.pdf', bbox_inches='tight')
 plt.close()
 print('OK: fig6')
 

@@ -45,7 +45,7 @@ def draw_arrow(ax, x1, y1, x2, y2, label='', color='#2C3E50'):
 # =====================================================
 fig, ax = plt.subplots(figsize=(DOUBLE_COL, 4.0))
 ax.set_xlim(-0.2, 7.4)
-ax.set_ylim(-0.3, 4.5)
+ax.set_ylim(-1.1, 4.5)
 ax.axis('off')
 
 # Input
@@ -161,8 +161,7 @@ for pi, (title, bg, border, steps) in enumerate(pipelines):
     for si, step in enumerate(steps):
         y = 2.1 - si * 0.45
         draw_box(ax, xbase + 0.1, y, 2.0, 0.35, step, '#FAFAFA', '#AAA', fontsize=5.5)
-        if si > 0:
-            draw_arrow(ax, xbase + 1.1, y + 0.4, xbase + 1.1, y + 0.35)
+        pass  # no arrows between steps
 
 fig.savefig(FDIR / 'fig4_orchestrator_pipelines.png', dpi=300, bbox_inches='tight')
 fig.savefig(FDIR / 'fig4_orchestrator_pipelines.pdf', bbox_inches='tight')
