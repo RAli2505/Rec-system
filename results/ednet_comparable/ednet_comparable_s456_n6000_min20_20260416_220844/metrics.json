@@ -1,0 +1,67 @@
+{
+  "run_name": "ednet_comparable_s456_n6000_min20_20260416_220844",
+  "dataset": "EdNet",
+  "seed": 456,
+  "n_students": 6000,
+  "min_interactions": 20,
+  "agent_metrics": {
+    "diagnostic": {
+      "time_s": 13.0
+    },
+    "confidence": {
+      "method": "rule_based",
+      "cv_f1_macro_mean": 1.0,
+      "cv_f1_macro_std": 0.0,
+      "full_f1_macro": 1.0,
+      "n_samples": 383575,
+      "n_classes": 6,
+      "class_distribution": {
+        "SOLID": 114029,
+        "UNSURE_CORRECT": 88077,
+        "FALSE_CONFIDENCE": 44639,
+        "CLEAR_GAP": 56923,
+        "DOUBT_CORRECT": 37796,
+        "DOUBT_INCORRECT": 42111
+      },
+      "time_s": 0.2
+    },
+    "knowledge_graph": {
+      "n_nodes": 14491,
+      "n_edges": 45743,
+      "time_s": 34.4
+    },
+    "prediction": {
+      "best_epoch": 17,
+      "val_auc": 0.7474,
+      "val_loss": 0.2157,
+      "total_epochs": 22,
+      "time_s": 1437.9
+    },
+    "recommendation": {
+      "time_s": 16.0
+    },
+    "personalization": {}
+  },
+  "eval_metrics": {
+    "lstm_f1_micro": 0.1647,
+    "lstm_threshold": 0.5,
+    "lstm_f1_macro": 0.0702,
+    "lstm_auc": 0.5895,
+    "lstm_auc_weighted": 0.602,
+    "precision@10": 0.7649,
+    "recall@10": 0.0392,
+    "ndcg@10": 0.7656,
+    "mrr": 0.7705,
+    "coverage": 0.2742,
+    "tag_coverage": 0.2742,
+    "question_coverage": 0.0046,
+    "eval_time_sec": 14.4,
+    "n_users_evaluated": 419,
+    "learning_gain_raw": 0.0467,
+    "learning_gain_raw_std": 0.1735,
+    "learning_gain": 0.023,
+    "learning_gain_std": 0.1344,
+    "learning_gain_trimmed": 0.0233
+  },
+  "eval_time_s": 14.4
+}
