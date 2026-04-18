@@ -52,7 +52,7 @@ if hist:
     l1, lb1 = ax1.get_legend_handles_labels()
     l2, lb2 = ax2.get_legend_handles_labels()
     ax1.legend(l1+l2, lb1+lb2, loc='center right', framealpha=0.9)
-    fig.savefig(FDIR/'fig5_training_curves.png', dpi=300)
+    fig.savefig(FDIR/'fig5_training_curves.png', dpi=600)
     fig.savefig(FDIR/'fig5_training_curves.pdf')
     plt.close()
     print('OK: fig5')
@@ -73,7 +73,7 @@ for mi,(label,key) in enumerate(mets):
 ax.set_xticks(x); ax.set_xticklabels(methods)
 ax.get_xticklabels()[-1].set_fontweight('bold')
 ax.set_ylabel('Score'); ax.legend(loc='upper left', ncol=4, framealpha=0.9, bbox_to_anchor=(0, 1.15)); ax.set_ylim(0,1.15)
-fig.savefig(FDIR/'fig6_mars_vs_baselines.png', dpi=300, bbox_inches='tight')
+fig.savefig(FDIR/'fig6_mars_vs_baselines.png', dpi=600, bbox_inches='tight')
 fig.savefig(FDIR/'fig6_mars_vs_baselines.pdf', bbox_inches='tight')
 plt.close()
 print('OK: fig6')
@@ -94,7 +94,7 @@ ax.plot(angles,gru_r,'^:',color='#2ca02c',linewidth=1.0,markersize=3,label='GRU'
 ax.fill(angles,gru_r,alpha=0.08,color='#2ca02c')
 ax.set_xticks(angles[:-1]); ax.set_xticklabels(cats,size=7)
 ax.legend(loc='upper right',bbox_to_anchor=(1.3,1.1),framealpha=0.9); ax.set_ylim(0,1.05)
-fig.savefig(FDIR/'fig7_radar_chart.png', dpi=300)
+fig.savefig(FDIR/'fig7_radar_chart.png', dpi=600)
 fig.savefig(FDIR/'fig7_radar_chart.pdf')
 plt.close()
 print('OK: fig7')
@@ -106,15 +106,40 @@ data_b = {'AUC':[seeds[s].get('lstm_auc',0) for s in sk],
            'MRR':[seeds[s].get('mrr',0) for s in sk],
            'P@10':[seeds[s].get('precision@10',0) for s in sk]}
 cb = ['#1f77b4','#ff7f0e','#2ca02c','#d62728']
-fig, ax = plt.subplots(figsize=(COL_WIDTH, 2.4))
-bp = ax.boxplot(list(data_b.values()), tick_labels=list(data_b.keys()), patch_artist=True, widths=0.5,
-                medianprops=dict(color='black',linewidth=1.5))
-for p,c in zip(bp['boxes'],cb): p.set_facecolor(c); p.set_alpha(0.4)
-for i,d in enumerate(data_b.values()):
-    xj = np.random.normal(i+1,0.04,len(d))
-    ax.scatter(xj,d,color=cb[i],s=20,zorder=5,edgecolor='black',linewidth=0.3)
+fig, ax = plt.subplots(figsize=(DOUBLE_COL, 3.2))
+positions = np.arange(1, len(data_b)+1)
+bp = ax.boxplot(list(data_b.values()), positions=positions, patch_artist=True, widths=0.45,
+                medianprops=dict(color='black',linewidth=1.5),
+                whiskerprops=dict(linewidth=0.8), capprops=dict(linewidth=0.8),
+                flierprops=dict(marker='', markersize=0))
+for p,c in zip(bp['boxes'],cb): p.set_facecolor(c); p.set_alpha(0.35)
+
+# jittered seed points
+np.random.seed(0)
+for i,(label,d) in enumerate(data_b.items()):
+    xj = np.random.normal(positions[i],0.05,len(d))
+    ax.scatter(xj,d,color=cb[i],s=28,zorder=5,edgecolor='black',linewidth=0.4,
+               label=f'Seed (n={len(d)})' if i==0 else None)
+
+# mean +/- std annotations above each box
+for i,(label,d) in enumerate(data_b.items()):
+    mu, sd = np.mean(d), np.std(d, ddof=1)
+    ymax = max(d)
+    ax.annotate(f'{mu:.3f}\n$\\pm${sd:.3f}', xy=(positions[i], ymax),
+                xytext=(0, 14), textcoords='offset points',
+                ha='center', fontsize=8, fontweight='bold')
+
+ax.set_xticks(positions)
+ax.set_xticklabels(list(data_b.keys()))
 ax.set_ylabel('Score')
-fig.savefig(FDIR/'fig8_seed_stability.png', dpi=300)
+ax.set_xlabel('Metric')
+ax.set_title(f'Per-seed stability on XES3G5M (n={len(sk)} independent runs)',
+             fontsize=10, fontweight='bold')
+# extend y-range for annotations
+ylim = ax.get_ylim()
+ax.set_ylim(ylim[0]-0.01, ylim[1]+0.04)
+ax.legend(loc='lower left', framealpha=0.9)
+fig.savefig(FDIR/'fig8_seed_stability.png', dpi=600)
 fig.savefig(FDIR/'fig8_seed_stability.pdf')
 plt.close()
 print('OK: fig8')
@@ -129,7 +154,7 @@ for bar,v in zip(bars,ndcg_s):
     ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.01, f'{v:.4f}', ha='center', fontsize=7, fontweight='bold')
 ax.set_xlabel('Student Performance Level'); ax.set_ylabel('NDCG@10')
 ax.set_xticks(x9); ax.set_xticklabels(subs); ax.set_ylim(0,0.75)
-fig.savefig(FDIR/'fig9_subgroup_analysis.png', dpi=300)
+fig.savefig(FDIR/'fig9_subgroup_analysis.png', dpi=600)
 fig.savefig(FDIR/'fig9_subgroup_analysis.pdf')
 plt.close()
 print('OK: fig9')
@@ -153,7 +178,7 @@ ax.barh(y10-h10/2, dm, h10, label='$\Delta$MRR', color='#ff7f0e', edgecolor='whi
 ax.set_yticks(y10); ax.set_yticklabels(dl, fontsize=7)
 ax.set_xlabel('Change in Score'); ax.axvline(x=0,color='black',linewidth=0.8)
 ax.legend(loc='lower left',framealpha=0.9)
-fig.savefig(FDIR/'fig10_ablation.png', dpi=300)
+fig.savefig(FDIR/'fig10_ablation.png', dpi=600)
 fig.savefig(FDIR/'fig10_ablation.pdf')
 plt.close()
 print('OK: fig10')

@@ -99,7 +99,7 @@ def fig1_training_curves():
 
     fig.suptitle("MARS Training on XES3G5M (seed=42)", fontsize=14, fontweight="bold")
     plt.tight_layout()
-    fig.savefig(FIGURES_DIR / "fig_training_curves.png", dpi=150, bbox_inches="tight")
+    fig.savefig(FIGURES_DIR / "fig_training_curves.png", dpi=600, bbox_inches="tight")
     fig.savefig(FIGURES_DIR / "fig_training_curves.pdf", bbox_inches="tight")
     plt.close()
     print("✓ fig_training_curves")
@@ -155,7 +155,7 @@ def fig2_mars_vs_baselines():
     ax.set_ylim(0, 1.05)
 
     plt.tight_layout()
-    fig.savefig(FIGURES_DIR / "fig_mars_vs_baselines.png", dpi=150, bbox_inches="tight")
+    fig.savefig(FIGURES_DIR / "fig_mars_vs_baselines.png", dpi=600, bbox_inches="tight")
     fig.savefig(FIGURES_DIR / "fig_mars_vs_baselines.pdf", bbox_inches="tight")
     plt.close()
     print("✓ fig_mars_vs_baselines")
@@ -199,7 +199,7 @@ def fig3_ednet_vs_xes3g5m():
     ax.axhline(y=0, color="black", linewidth=0.5)
 
     plt.tight_layout()
-    fig.savefig(FIGURES_DIR / "fig_ednet_vs_xes3g5m.png", dpi=150, bbox_inches="tight")
+    fig.savefig(FIGURES_DIR / "fig_ednet_vs_xes3g5m.png", dpi=600, bbox_inches="tight")
     fig.savefig(FIGURES_DIR / "fig_ednet_vs_xes3g5m.pdf", bbox_inches="tight")
     plt.close()
     print("✓ fig_ednet_vs_xes3g5m")
@@ -253,7 +253,7 @@ def fig4_radar_chart():
     ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=11)
 
     plt.tight_layout()
-    fig.savefig(FIGURES_DIR / "fig_radar_chart.png", dpi=150, bbox_inches="tight")
+    fig.savefig(FIGURES_DIR / "fig_radar_chart.png", dpi=600, bbox_inches="tight")
     fig.savefig(FIGURES_DIR / "fig_radar_chart.pdf", bbox_inches="tight")
     plt.close()
     print("✓ fig_radar_chart")
@@ -291,7 +291,7 @@ def fig5_seed_stability():
                  fontweight="bold")
 
     plt.tight_layout()
-    fig.savefig(FIGURES_DIR / "fig_seed_stability.png", dpi=150, bbox_inches="tight")
+    fig.savefig(FIGURES_DIR / "fig_seed_stability.png", dpi=600, bbox_inches="tight")
     fig.savefig(FIGURES_DIR / "fig_seed_stability.pdf", bbox_inches="tight")
     plt.close()
     print("✓ fig_seed_stability")

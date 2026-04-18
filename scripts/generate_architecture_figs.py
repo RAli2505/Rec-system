@@ -32,60 +32,61 @@ def draw_box(ax, x, y, w, h, text, color='#EBF0F5', border='#5B7BA0', fontsize=7
                 ha='center', va='top', fontsize=fs, fontweight=weight, fontstyle=style)
 
 
-def draw_arrow(ax, x1, y1, x2, y2, label='', color='#2C3E50'):
+def draw_arrow(ax, x1, y1, x2, y2, label='', color='#2C3E50', label_offset=(0.12, 0)):
     ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
                 arrowprops=dict(arrowstyle='->', color=color, lw=0.8))
     if label:
         mx, my = (x1+x2)/2, (y1+y2)/2
-        ax.text(mx+0.05, my+0.05, label, fontsize=5.5, color='#555', style='italic')
+        ax.text(mx + label_offset[0], my + label_offset[1], label,
+                fontsize=6, color='#555', style='italic', ha='left', va='center')
 
 
 # =====================================================
 # FIG 1: MARS System Architecture
 # =====================================================
-fig, ax = plt.subplots(figsize=(DOUBLE_COL, 4.0))
-ax.set_xlim(-0.2, 7.4)
-ax.set_ylim(-1.1, 4.5)
+fig, ax = plt.subplots(figsize=(DOUBLE_COL, 5.2))
+ax.set_xlim(-0.3, 7.5)
+ax.set_ylim(-1.3, 5.3)
 ax.axis('off')
 
 # Input
-draw_box(ax, 0.5, 3.8, 6.2, 0.5, 'Datasets\nEdNet KT2 (TOEIC) + XES3G5M (Math)', '#AED6F1', '#5DADE2')
+draw_box(ax, 0.5, 4.6, 6.2, 0.5, 'Datasets\nEdNet KT2 (TOEIC) + XES3G5M (Math)', '#AED6F1', '#5DADE2')
 
 # Orchestrator frame
-rect = mpatches.FancyBboxPatch((0.2, 0.3), 6.8, 3.2, boxstyle="round,pad=0.1",
+rect = mpatches.FancyBboxPatch((0.2, 0.1), 6.8, 4.1, boxstyle="round,pad=0.1",
                                  facecolor='#FAFAFA', edgecolor='#2C3E50', linewidth=1.5, linestyle='--')
 ax.add_patch(rect)
-ax.text(3.6, 3.35, 'ORCHESTRATOR', ha='center', fontsize=10, fontweight='bold', color='#2C3E50')
+ax.text(3.6, 4.05, 'ORCHESTRATOR', ha='center', fontsize=10, fontweight='bold', color='#2C3E50')
 
-# Pipelines
+# Pipelines row
 for i, (name, col) in enumerate([('Cold-Start', '#D6EAF8'), ('Assessment', '#D5F5E3'), ('Continuous', '#FDEBD0')]):
-    draw_box(ax, 0.5 + i*2.2, 2.9, 1.8, 0.35, name, col, '#888', fontsize=7)
+    draw_box(ax, 0.5 + i*2.2, 3.45, 1.8, 0.35, name, col, '#888', fontsize=7)
 
-# Row 1: Diagnostic + Confidence
-draw_box(ax, 0.5, 2.0, 2.8, 0.7, 'DiagnosticAgent\nIRT 3PL + CAT\ntheta estimation', '#EBF0F5', '#5B7BA0')
-draw_box(ax, 3.9, 2.0, 2.8, 0.7, 'ConfidenceAgent\nRule-based 6-class\nbehavioral confidence', '#EBF0F5', '#5B7BA0')
+# Row 1: Diagnostic + Confidence  (y = 2.5 .. 3.2)
+draw_box(ax, 0.5, 2.5, 2.8, 0.7, 'DiagnosticAgent\nIRT 3PL + CAT\ntheta estimation', '#EBF0F5', '#5B7BA0')
+draw_box(ax, 3.9, 2.5, 2.8, 0.7, 'ConfidenceAgent\nRule-based 6-class\nbehavioral confidence', '#EBF0F5', '#5B7BA0')
 
-# Row 2: KG + Prediction
-draw_box(ax, 0.5, 1.0, 2.8, 0.7, 'KnowledgeGraphAgent\nGraphSAGE + Prerequisites\ngap_tags, prereq_map', '#EBF0F5', '#5B7BA0')
-draw_box(ax, 3.9, 1.0, 2.8, 0.7, 'PredictionAgent\nSAINT Transformer 4L/256d\n293-dim gap_probs', '#EBF0F5', '#5B7BA0')
+# Row 2: KG + Prediction  (y = 1.4 .. 2.1)
+draw_box(ax, 0.5, 1.4, 2.8, 0.7, 'KnowledgeGraphAgent\nGraphSAGE + Prerequisites\ngap_tags, prereq_map', '#EBF0F5', '#5B7BA0')
+draw_box(ax, 3.9, 1.4, 2.8, 0.7, 'PredictionAgent\nSAINT Transformer 4L/256d\n293-dim gap_probs', '#EBF0F5', '#5B7BA0')
 
-# Row 3: Recommendation + Personalization
-draw_box(ax, 0.5, 0.0, 3.5, 0.7, 'RecommendationAgent\nThompson Sampling + 6-feature scoring\nMMR diversity + prereq filter', '#E8DAEF', '#8E44AD')
-draw_box(ax, 4.5, 0.0, 2.2, 0.7, 'PersonalizationAgent\nIRT 5-level stratification', '#EBF0F5', '#5B7BA0')
+# Row 3: Recommendation + Personalization  (y = 0.3 .. 1.0)
+draw_box(ax, 0.5, 0.3, 3.3, 0.7, 'RecommendationAgent\nThompson Sampling + 6-feature scoring\nMMR diversity + prereq filter', '#E8DAEF', '#8E44AD')
+draw_box(ax, 4.3, 0.3, 2.4, 0.7, 'PersonalizationAgent\nIRT 5-level stratification', '#EBF0F5', '#5B7BA0')
 
-# Arrows
-draw_arrow(ax, 3.6, 3.8, 3.6, 3.55)  # input → orchestrator
-draw_arrow(ax, 1.9, 2.0, 1.9, 1.75, 'theta')  # diag → KG
-draw_arrow(ax, 5.3, 2.0, 5.3, 1.75, 'conf_class')  # conf → pred
-draw_arrow(ax, 1.9, 1.0, 2.0, 0.75, 'prereq_map')  # KG → rec
-draw_arrow(ax, 5.3, 1.0, 4.0, 0.75, 'gap_probs')  # pred → rec
-draw_arrow(ax, 5.6, 0.0, 5.6, -0.15)  # pers → out
+# Arrows (vertical gaps are 0.3 wide, enough room for labels)
+draw_arrow(ax, 3.6, 4.6, 3.6, 4.22)                               # input -> orchestrator
+draw_arrow(ax, 1.9, 2.5, 1.9, 2.12, 'theta')                      # diag -> KG
+draw_arrow(ax, 5.3, 2.5, 5.3, 2.12, 'conf_class')                 # conf -> pred
+draw_arrow(ax, 1.9, 1.4, 1.9, 1.02, 'prereq_map')                 # KG -> rec
+draw_arrow(ax, 5.0, 1.4, 3.5, 1.02, 'gap_probs', label_offset=(0.08, 0.08))  # pred -> rec (diagonal)
+draw_arrow(ax, 5.5, 0.3, 5.5, -0.12)                              # pers -> out
 
 # Output
 draw_box(ax, 1.5, -0.6, 4.2, 0.35, 'Personalized Recommendation List (Top-K)', '#A9DFBF', '#27AE60')
-draw_arrow(ax, 2.5, 0.0, 3.0, -0.2)
+draw_arrow(ax, 2.2, 0.3, 2.8, -0.22)                              # rec -> out
 
-fig.savefig(FDIR / 'fig1_mars_architecture.png', dpi=300, bbox_inches='tight')
+fig.savefig(FDIR / 'fig1_mars_architecture.png', dpi=600, bbox_inches='tight')
 fig.savefig(FDIR / 'fig1_mars_architecture.pdf', bbox_inches='tight')
 plt.close()
 print('OK: fig1_mars_architecture')
@@ -128,7 +129,7 @@ for name, xp in agents:
 draw_box(ax, 2.0, 0.0, 3.2, 0.45, 'Evaluation: 5 seeds x 15 metrics\nOrchestrator batch_evaluation', '#E8DAEF', '#8E44AD', fontsize=6)
 draw_arrow(ax, 5.65, 2.0, 3.6, 0.5)
 
-fig.savefig(FDIR / 'fig2_data_pipeline.png', dpi=300, bbox_inches='tight')
+fig.savefig(FDIR / 'fig2_data_pipeline.png', dpi=600, bbox_inches='tight')
 fig.savefig(FDIR / 'fig2_data_pipeline.pdf', bbox_inches='tight')
 plt.close()
 print('OK: fig2_data_pipeline')
@@ -137,9 +138,9 @@ print('OK: fig2_data_pipeline')
 # =====================================================
 # FIG 4: Orchestrator Pipelines (simplified sequence)
 # =====================================================
-fig, ax = plt.subplots(figsize=(DOUBLE_COL, 3.0))
-ax.set_xlim(-0.3, 7.5)
-ax.set_ylim(-0.2, 3.2)
+fig, ax = plt.subplots(figsize=(DOUBLE_COL, 3.8))
+ax.set_xlim(-0.3, 8.1)
+ax.set_ylim(-0.8, 3.5)
 ax.axis('off')
 
 # Three pipeline columns
@@ -153,17 +154,22 @@ pipelines = [
      ['PredictionAgent\nupdate_state()', 'RecommendAgent\nre_rank()']),
 ]
 
-for pi, (title, bg, border, steps) in enumerate(pipelines):
-    xbase = pi * 2.5
-    # Title
-    draw_box(ax, xbase, 2.6, 2.2, 0.4, title, bg, border, fontsize=7)
-    # Steps
-    for si, step in enumerate(steps):
-        y = 2.1 - si * 0.45
-        draw_box(ax, xbase + 0.1, y, 2.0, 0.35, step, '#FAFAFA', '#AAA', fontsize=5.5)
-        pass  # no arrows between steps
+COL_W = 2.4
+COL_SPACE = 0.4
+STEP_H = 0.45
+STEP_GAP = 0.08
 
-fig.savefig(FDIR / 'fig4_orchestrator_pipelines.png', dpi=300, bbox_inches='tight')
+for pi, (title, bg, border, steps) in enumerate(pipelines):
+    xbase = pi * (COL_W + COL_SPACE)
+    # Title
+    draw_box(ax, xbase, 2.85, COL_W, 0.42, title, bg, border, fontsize=7)
+    # Steps (clear gap between boxes, no arrows)
+    for si, step in enumerate(steps):
+        y = 2.3 - si * (STEP_H + STEP_GAP)
+        draw_box(ax, xbase + 0.1, y, COL_W - 0.2, STEP_H, step,
+                 '#FAFAFA', '#AAA', fontsize=5.5)
+
+fig.savefig(FDIR / 'fig4_orchestrator_pipelines.png', dpi=600, bbox_inches='tight')
 fig.savefig(FDIR / 'fig4_orchestrator_pipelines.pdf', bbox_inches='tight')
 plt.close()
 print('OK: fig4_orchestrator_pipelines')
