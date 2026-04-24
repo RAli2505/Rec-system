@@ -1,0 +1,18 @@
+| Metric | XES3G5M | EdNet KT2 (6k sample) |
+|---|---:|---:|
+| Students (sampled) | 6,000 | 2,784 |
+| Interactions (total) | 2,134,487 | 545,986 |
+| Avg interactions / student | 355.748 | 196.116 |
+| Median interactions / student | 329.000 | 64.000 |
+| Std interactions / student | 103.701 | 424.156 |
+| Min / Max interactions | 200 / 1028 | 20 / 8257 |
+| Unique questions | 7,373 | 10,690 |
+| Unique concepts (KC) | 858 | 187 |
+| Overall accuracy | 0.798 | 0.626 |
+| Mean per-user accuracy | 0.790 | 0.598 |
+| Std per-user accuracy | 0.127 | 0.122 |
+| Train / Val / Test users | 4200 / 900 / 900 | 1948 / 417 / 419 |
+| Train / Val / Test rows | 1,500,899 / 317,716 / 315,872 | 390,184 / 80,829 / 74,973 |
+| Median elapsed_time (ms) | 15,000 | 24,376 |
+| P95  elapsed_time (ms) | 15,000 | 103,153 |
+| Answer-change rate | 0.000 | 0.200 |
