@@ -388,6 +388,7 @@ class Orchestrator:
         test_df: pd.DataFrame,
         top_k: int = 10,
         context_ratio: float = 0.5,
+        save_per_user: bool = False,
     ) -> dict[str, float]:
         """
         Run the full system on a test set and compute recommendation metrics.
@@ -435,6 +436,11 @@ class Orchestrator:
         user_ids = list(grouped.keys())
         has_tags = "tags" in test_df.columns
 
+        # Concept-space size — read dynamically so we honour any
+        # set_num_tags() call made before this evaluation.
+        from agents import prediction_agent as _PA
+        n_tags_eval = _PA.NUM_TAGS
+
         def _parse_tags_set(series) -> set:
             """Fast tag extraction from a pandas Series of tag values."""
             tags: set = set()
@@ -449,8 +455,8 @@ class Orchestrator:
             return tags
 
         def _build_gt_tag_labels(ground_truth) -> np.ndarray:
-            """Build 293-dim failure vector from ground truth rows."""
-            gt_tag_labels = np.zeros(293, dtype=np.float32)
+            """Build n_tags_eval-dim failure vector from ground truth rows."""
+            gt_tag_labels = np.zeros(n_tags_eval, dtype=np.float32)
             if not has_tags:
                 return gt_tag_labels
             incorrect = ground_truth[~ground_truth["correct"].astype(bool)]
@@ -467,7 +473,7 @@ class Orchestrator:
                 else:
                     continue
                 for tag_id in tag_list:
-                    if 0 <= tag_id < 293:
+                    if 0 <= tag_id < n_tags_eval:
                         gt_tag_labels[tag_id] = 1.0
             return gt_tag_labels
 
@@ -542,7 +548,10 @@ class Orchestrator:
                 )
 
         # Compute metrics
-        metrics = self._compute_metrics(all_preds, all_recs, top_k, test_df)
+        metrics = self._compute_metrics(
+            all_preds, all_recs, top_k, test_df,
+            save_per_user=save_per_user,
+        )
         elapsed = time.time() - t0
         metrics["eval_time_sec"] = round(elapsed, 1)
         metrics["n_users_evaluated"] = len(all_preds)
@@ -578,25 +587,32 @@ class Orchestrator:
         all_recs: list[dict],
         top_k: int,
         full_df: pd.DataFrame,
+        save_per_user: bool = False,
     ) -> dict[str, float]:
         """Aggregate predictions and recommendations into standard metrics."""
         metrics: dict[str, float] = {}
 
-        # --- LSTM gap prediction metrics (293-dim multilabel) ---
+        # Read concept-space size at call time so set_num_tags() takes effect.
+        from agents import prediction_agent as _PA
+        n_tags_eval = _PA.NUM_TAGS
+
+        # --- LSTM gap prediction metrics (n_tags_eval-dim multilabel) ---
         if all_preds:
             from sklearn.metrics import f1_score, roc_auc_score
 
-            gap_probs_list = []   # (N, 293)
-            gap_labels_list = []  # (N, 293)
+            gap_probs_list = []   # (N, n_tags_eval)
+            gap_labels_list = []  # (N, n_tags_eval)
 
             for entry in all_preds:
                 preds = entry["predicted"]
                 gt_labels = entry.get("gt_tag_labels")
 
-                # LSTM format: gap_probabilities is a 293-dim list
+                # gap_probabilities is an n_tags_eval-dim list (was hardcoded
+                # 293 — now reads dynamic NUM_TAGS from prediction_agent so
+                # XES3G5M (865 concepts) and EdNet (293) both work).
                 if isinstance(preds, dict) and "gap_probabilities" in preds:
                     probs = preds["gap_probabilities"]
-                    if isinstance(probs, list) and len(probs) == 293 and gt_labels is not None:
+                    if isinstance(probs, list) and len(probs) == n_tags_eval and gt_labels is not None:
                         gap_probs_list.append(probs)
                         gap_labels_list.append(gt_labels)
 
@@ -656,6 +672,7 @@ class Orchestrator:
                 )
 
         # --- Recommendation metrics (tag-based relevance) ---
+        per_user_rows: list[dict] = []
         if all_recs:
             precisions = []
             recalls = []
@@ -751,6 +768,16 @@ class Orchestrator:
                         break
                 mrrs.append(rr)
 
+                if save_per_user:
+                    per_user_rows.append({
+                        "user_id": str(entry.get("user_id", "")),
+                        "precision_at_k": precisions[-1],
+                        "recall_at_k": recalls[-1],
+                        "ndcg_at_k": ndcgs[-1],
+                        "mrr": mrrs[-1],
+                        "n_gt_tags": len(gt_tags),
+                    })
+
             metrics[f"precision@{top_k}"] = round(float(np.mean(precisions)), 4)
             metrics[f"recall@{top_k}"] = round(float(np.mean(recalls)), 4)
             metrics[f"ndcg@{top_k}"] = round(float(np.mean(ndcgs)), 4)
@@ -796,6 +823,9 @@ class Orchestrator:
             metrics["question_coverage"] = round(
                 len(question_recs & all_questions) / len(all_questions), 4
             ) if all_questions else 0.0
+
+        if save_per_user:
+            metrics["per_user"] = per_user_rows
 
         return metrics
 

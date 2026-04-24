@@ -1,0 +1,29 @@
+{
+  "ece": 0.0621,
+  "brier": 0.0264,
+  "base_rate": 0.0058,
+  "n_eval_tags": 517,
+  "by_ability_tertile": [
+    {
+      "bucket": "low (27-75%)",
+      "n_users": 300,
+      "n_seqs": 6304,
+      "ndcg10": 0.5147,
+      "ndcg10_std": 0.2908
+    },
+    {
+      "bucket": "mid (75-86%)",
+      "n_users": 301,
+      "n_seqs": 6567,
+      "ndcg10": 0.458,
+      "ndcg10_std": 0.3083
+    },
+    {
+      "bucket": "high (86-99%)",
+      "n_users": 298,
+      "n_seqs": 5153,
+      "ndcg10": 0.4279,
+      "ndcg10_std": 0.3247
+    }
+  ]
+}

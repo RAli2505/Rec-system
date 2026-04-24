@@ -105,13 +105,17 @@ def setup_publication_style():
 
 # ── Save helper ──────────────────────────────────────────────────────
 
-def save_figure(fig, name, results_dir="results"):
-    """Save figure as PNG (300 DPI) + PDF (vector)."""
+def save_figure(fig, name, results_dir="results", dpi=600):
+    """Save figure as PNG (600 DPI journal-grade) + PDF (vector).
+
+    Raised from 300 → 600 to satisfy Springer Nature's submission
+    guideline for bitmap figures (reviewer item #37).
+    """
     out = Path(results_dir)
     out.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out / f"{name}.png", dpi=300, bbox_inches="tight")
+    fig.savefig(out / f"{name}.png", dpi=dpi, bbox_inches="tight")
     fig.savefig(out / f"{name}.pdf", bbox_inches="tight")
-    print(f"Saved: {name}.png + {name}.pdf")
+    print(f"Saved: {name}.png + {name}.pdf @ {dpi} dpi")
 
 
 # ── Annotation helpers ───────────────────────────────────────────────

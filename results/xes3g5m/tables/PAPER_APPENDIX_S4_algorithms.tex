@@ -1,0 +1,107 @@
+% Appendix S4 — Pseudo-code of the Orchestrator pipelines.
+% Drop-in LaTeX for sn-article.tex. Requires the algorithm2e package
+% (already loaded by the SN template; otherwise add \usepackage[ruled]{algorithm2e}).
+%
+% Each algorithm corresponds to one Orchestrator pipeline depicted in
+% Fig.~\ref{fig2}. The split between assessment and continuous pipelines
+% mirrors the implementation in agents/orchestrator.py: assessment
+% rebuilds every agent state from the entire interaction batch, whereas
+% continuous performs an incremental update after a single interaction.
+
+\section*{Appendix S4 — Pipeline pseudo-code}\label{appendix:s4}
+
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetKwInput{KwInput}{Input}
+\SetKwInput{KwOutput}{Output}
+\KwInput{user $u$, profile $\mathcal{P}_u$ (may be empty for new users)}
+\KwOutput{initial top-$K$ recommendation list}
+
+$\hat\theta_u, \mathrm{SE}(\hat\theta_u) \gets$
+  \texttt{DiagnosticAgent}.\textsc{cat\_init}$(\mathcal{P}_u, K_{\max}=15, \mathrm{SE}_{\max}=0.3)$\;
+$\mathcal{T}_u^{\text{cold}} \gets$ \texttt{KGAgent}.\textsc{cold\_start}$(\hat\theta_u)$
+  \tcp*{root tags + immediate prerequisites}
+$\mathcal{C} \gets$ \texttt{RecommendationAgent}.\textsc{explore}%
+  $(\mathcal{T}_u^{\text{cold}}, \alpha_{\text{TS}}=1, \beta_{\text{TS}}=1)$
+  \tcp*{Beta--Bernoulli prior, no exploitation yet}
+$\mathcal{R}_u^{\text{init}} \gets$ \textsc{MMR}$(\mathcal{C}, \lambda=0.8, K=10)$\;
+\Return $\mathcal{R}_u^{\text{init}}$\;
+\caption{\texttt{ColdStartPipeline} — initial recommendation for a new user.}
+\label{alg:cold_start}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetKwInput{KwInput}{Input}
+\SetKwInput{KwOutput}{Output}
+\KwInput{user $u$, batch of $N$ interactions $\mathcal{I}_u$}
+\KwOutput{updated top-$K$ recommendation list, refreshed agent state}
+
+\tcp{1. Per-interaction behavioural confidence}
+\For{$i \in \mathcal{I}_u$}{
+  $c_i \gets$ \texttt{ConfidenceAgent}.\textsc{classify}$(i)$
+    \tcp*{$c_i \in \{\text{SOLID}, \text{UNSURE\_CORRECT}, \text{FALSE\_CONF}, \text{CLEAR\_GAP}, \text{DOUBT\_C}, \text{DOUBT\_I}\}$}
+  $i.\texttt{confidence\_class} \gets c_i$\;
+}
+
+\tcp{2. Re-calibrate ability via IRT 3PL + behavioural deltas}
+$\hat\theta_u, \mathrm{SE}(\hat\theta_u) \gets$
+  \texttt{DiagnosticAgent}.\textsc{calibrate}$(\mathcal{I}_u, c_{1\dots N})$\;
+
+\tcp{3. Update mastery and prerequisite profile}
+$\mathcal{M}_u, \mathcal{G}_u \gets$
+  \texttt{KGAgent}.\textsc{update\_profile}$(u, \mathcal{I}_u)$
+  \tcp*{$\mathcal{M}_u$: mastered tag set; $\mathcal{G}_u$: gap tag set}
+
+\tcp{4. Predict 858-dim gap probability vector}
+$\mathbf{g}_u \in [0,1]^{858} \gets$
+  \texttt{PredictionAgent}.\textsc{predict\_gaps}$(\mathcal{I}_u[-100{:}],
+   \text{horizon}=20)$\;
+
+\tcp{5. Stratify into one of five IRT-derived ability levels}
+$\ell_u \gets$ \texttt{PersonalizationAgent}.\textsc{assign\_level}$(\hat\theta_u)$
+  \tcp*{$\ell_u \in \{1,2,3,4,5\}$}
+
+\tcp{6. Assemble candidate pool from three retrieval strategies}
+$\mathcal{C}_u \gets$ \texttt{RecommendationAgent}.\textsc{candidates}$(\mathcal{G}_u, u, \ell_u)$%
+  \tcp*{KB $\cup$ CB-Sentence-BERT $\cup$ ALS-CF}
+
+\tcp{7. Score each candidate and re-rank for diversity}
+\ForEach{$c \in \mathcal{C}_u$}{
+  $\mathrm{strategy}_c \gets$ Thompson-Sampling weight of $c$'s retrieval branch\;
+  $\mathrm{gap}_c \gets \mathbf{g}_u[\,\mathrm{tag}(c)\,]$\;
+  $\mathrm{zpd}_c \gets \mathbf{1}[\,|b_c - \hat\theta_u| < 0.5\,]$
+    \tcp*{ZPD bonus: difficulty $b_c$ near $\hat\theta_u$}
+  $s_c \gets \mathrm{strategy}_c
+            + 0.25\cdot \mathrm{gap}_c
+            + 0.10\cdot \mathrm{zpd}_c$\;
+}
+$\mathcal{R}_u \gets$ \textsc{MMR}$(\mathcal{C}_u, \mathrm{score}=s, \lambda=0.8, K=10)$\;
+\Return $\mathcal{R}_u, (\hat\theta_u, \mathcal{M}_u, \mathbf{g}_u, \ell_u)$\;
+\caption{\texttt{AssessmentPipeline} — refresh all agents after a batch of student responses.}
+\label{alg:assessment}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\DontPrintSemicolon
+\SetKwInput{KwInput}{Input}
+\SetKwInput{KwOutput}{Output}
+\KwInput{user $u$, single new interaction $i$, current state
+         $(\hat\theta_u, \mathcal{M}_u, \mathbf{g}_u^{(t)}, \mathcal{R}_u^{(t)})$}
+\KwOutput{re-ranked top-$K$ list $\mathcal{R}_u^{(t+1)}$}
+
+$c_i \gets$ \texttt{ConfidenceAgent}.\textsc{classify}$(i)$\;
+\tcp{Incremental gap update — single forward pass on the last 100 events}
+$\mathbf{g}_u^{(t+1)} \gets$
+  \texttt{PredictionAgent}.\textsc{update\_state}$(i, c_i)$\;
+\If(\tcp*[h]{re-rank only when behavioural class changes meaningfully}){$c_i \in \{\text{FALSE\_CONF}, \text{CLEAR\_GAP}, \text{DOUBT\_I}\}$}{
+  re-score $\mathcal{R}_u^{(t)}$ using $\mathbf{g}_u^{(t+1)}$\;
+  $\mathcal{R}_u^{(t+1)} \gets$ \textsc{MMR-shuffle}$(\mathcal{R}_u^{(t)}, K=10)$\;
+}
+\Else{
+  $\mathcal{R}_u^{(t+1)} \gets \mathcal{R}_u^{(t)}$\;
+}
+\Return $\mathcal{R}_u^{(t+1)}$\;
+\caption{\texttt{ContinuousPipeline} — per-interaction incremental update; no full agent re-runs.}
+\label{alg:continuous}
+\end{algorithm}

@@ -26,9 +26,11 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from agents import prediction_agent as PA
 from agents.prediction_agent import (
-    GapSequenceDataset, create_model, NUM_TAGS, DEVICE,
+    GapSequenceDataset, create_model, DEVICE,
     NUM_CONF_CLASSES, LABEL_SMOOTHING, NUM_WORKERS,
+    set_num_tags,
 )
 from agents.utils import set_global_seed
 from data.xes3g5m_loader import load_xes3g5m
@@ -325,15 +327,23 @@ def main():
     for df in [train_df, val_df, test_df]:
         df["confidence_class"] = 0
 
-    all_tags = set()
-    for df in [train_df, val_df, test_df]:
-        for tags in df["tags"]:
-            if isinstance(tags, list):
-                all_tags.update(tags)
-    n_tags = NUM_TAGS  # use model's NUM_TAGS for consistency
+    # Determine concept-space size DYNAMICALLY from training data.
+    # XES3G5M has 858 concepts; EdNet TOEIC has 293. Hardcoding NUM_TAGS=293
+    # silently dropped ~565 XES3G5M concepts from labels (concept_id >= 293
+    # was filtered out in label construction), inflating reported AUC.
+    # We now derive n_tags from train data and propagate it via set_num_tags().
+    train_max_id = 0
+    for tags in train_df["tags"]:
+        if isinstance(tags, list) and tags:
+            train_max_id = max(train_max_id, max(int(t) for t in tags))
+    n_tags = train_max_id + 1
+    logger.info("Concept-space: max_train_id=%d  ->  NUM_TAGS=%d",
+                train_max_id, n_tags)
+    set_num_tags(n_tags)  # MUST be called BEFORE building any dataset/model
 
     test_dataset = GapSequenceDataset(test_df)
-    logger.info("Test sequences: %d", len(test_dataset))
+    logger.info("Test sequences: %d  (label dim = %d)",
+                len(test_dataset), PA.NUM_TAGS)
 
     results = {}
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -1,0 +1,19 @@
+\begin{table}[t]
+\centering
+\caption{Ablation with Pareto analysis and composite \texttt{PedScore} =
+$0.4\cdot\mathrm{NDCG@10} + 0.4\cdot\mathrm{Coverage} + 0.2\cdot\mathrm{AUC}$.
+Full MARS dominates removed-component variants on the composite metric and
+sits on the Pareto frontier of the (NDCG@10, Coverage) trade-off.}
+\label{tab:ablation_pareto}
+\begin{tabular}{lrrrrrc}
+\toprule
+Configuration & AUC-ROC & NDCG@10 & Coverage & PedScore & $\Delta$~PedScore & Pareto \\
+\midrule
+\textbf{Full MARS} & 0.9176 & 0.6540 & 0.7353 & 0.7392 & --- & $\checkmark$ \\
+- Prediction & 0.5077 & 0.5485 & 0.0649 & 0.3469 & -0.3923 &  \\
+- Knowledge Graph & 0.9253 & 0.6584 & 0.7029 & 0.7296 & -0.0097 &  \\
+- Confidence & 0.9304 & 0.6734 & 0.7054 & 0.7376 & -0.0016 & $\checkmark$ \\
+- IRT (Diagnostic) & 0.9262 & 0.7344 & 0.3446 & 0.6168 & -0.1224 & $\checkmark$ \\
+\bottomrule
+\end{tabular}
+\end{table}

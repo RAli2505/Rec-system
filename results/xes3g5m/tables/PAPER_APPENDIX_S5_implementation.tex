@@ -1,0 +1,167 @@
+% Appendix S5 — Implementation details, reproducibility, evaluation protocol.
+% Auto-generated from env scan on 2026-04-24.
+% Drop into sn-article.tex where an appendix section is expected.
+
+\section*{Appendix S5 — Implementation details and evaluation protocol}
+\label{appendix:s5}
+
+\subsection*{S5.1 Software stack}
+
+All experiments are reproduced on Python 3.12.10 with the following
+library versions (pinned in \texttt{requirements.txt}):
+
+\begin{itemize}\itemsep0pt
+  \item \texttt{torch 2.11.0+cu128}, \texttt{torchvision 0.26.0+cu128},
+        \texttt{torchaudio 2.11.0+cu128} (CUDA 12.8 runtime)
+  \item \texttt{torch-geometric 2.7.0} — GraphSAGE embeddings
+        (Section~\ref{sec:kg})
+  \item \texttt{transformers 5.4.0}, \texttt{sentence-transformers 5.3.0}
+        — Sentence-BERT \texttt{all-MiniLM-L6-v2} for content retrieval
+  \item \texttt{faiss-cpu 1.13.2} — approximate nearest-neighbour index
+  \item \texttt{implicit} — ALS collaborative filtering
+  \item \texttt{xgboost 3.2.0}, \texttt{lightgbm 4.6.0} (used in
+        experimental variants, not in the final pipeline)
+  \item \texttt{scikit-learn 1.8.0}, \texttt{scipy 1.17.1},
+        \texttt{numpy 1.26.4}, \texttt{pandas 3.0.1}
+  \item \texttt{networkx 3.6.1} — prerequisite-graph manipulation
+  \item \texttt{py-irt 0.1.1} — reference 3PL implementation used for
+        calibration cross-checks
+  \item \texttt{matplotlib 3.10.8} — figure rendering
+\end{itemize}
+
+\subsection*{S5.2 Hardware}
+
+Single-GPU configuration: NVIDIA GeForce RTX 5050 Laptop GPU
+(8\,151\,MiB VRAM, driver 573.13, CUDA 12.8). Host has 32\,GB system
+RAM. No distributed training; every reported number is from a single
+GPU run.
+
+\subsection*{S5.3 Wall-clock per component}
+
+Agent wall-clock per pipeline execution, averaged across seeds
+$\{42, 123, 456, 789, 2024\}$ on XES3G5M with $n_{\text{students}}{=}6000$:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+Component & Mean (s) & Std (s)\\
+\midrule
+Diagnostic (IRT calibration, EM) & 11.6   & 7.0  \\
+Confidence (rule-based calibration) & 0.4   & 0.2  \\
+Knowledge Graph + GraphSAGE + prerequisite mining & 347.9 & 104.0 \\
+Prediction (transformer, 10.5 epochs mean) & 2{,}858.9 & 1{,}425.8 \\
+Recommendation (index + priors) & 63.0  & 22.3 \\
+Personalization (K-Means, 5 levels) & 3.0   & 1.1  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Total end-to-end time per seed is approximately 55\,min, of which the
+transformer training dominates (80--90\%). Evaluation on 900 held-out
+test users adds $\sim$45\,s.
+
+\subsection*{S5.4 Seeds and determinism}
+
+Every experiment fixes a single global seed that is propagated to
+(i) the user-level \texttt{train/val/test} split, (ii) PyTorch
+initialisation (weights, dropout, DataLoader shuffle), (iii) NumPy
+random state used by GraphSAGE link-prediction sampling,
+(iv) Thompson-Sampling Beta priors, and (v) K-Means centroid
+initialisation in the Personalization Agent. Propagation was audited
+in Section~\ref{sec:repro} and is implemented by
+\texttt{BaseAgent.global\_seed}; agent-level code may not silently
+default to~42. The five seeds used throughout are
+$\{42, 123, 456, 789, 2024\}$.
+
+\subsection*{S5.5 Evaluation protocol}
+\label{appendix:s5_eval}
+
+For each test user, the chronologically-ordered interaction sequence
+is split at the 30/70 boundary: the first 30\% of interactions form
+the \emph{context} and seed the agent state (CAT estimate of
+$\theta$, behavioural confidence history, prerequisite map); the
+remaining 70\% form the \emph{evaluation horizon}. The Prediction
+Agent emits a distribution over the 858 concepts; the ground-truth
+top-$k$ label set for NDCG@10 / MRR / Precision@10 is the set of
+concepts the user fails in the next 20 chronologically-ordered
+interactions of the evaluation horizon (a re-attempted concept
+counts once). Tag Coverage is the fraction of distinct concepts in
+the union of all top-10 recommendations across test users,
+normalised by the number of concepts that satisfy the macro-AUC
+support criterion ($\geq 5$ positive and $\geq 5$ negative
+interactions in the test horizon).
+
+\subsection*{S5.6 Training objective}
+
+The prediction head is optimised with a class-weighted focal binary
+cross-entropy applied independently to each of the 858 concept
+outputs. Let $\hat p_{i,t} = \sigma(z_{i,t})$ denote the predicted
+failure probability for user-window $i$ on tag $t$, and let
+$y_{i,t} \in \{0,1\}$ be the ground-truth label. Label smoothing is
+applied to the targets:
+\[
+\tilde y_{i,t} = (1-\varepsilon)\, y_{i,t} + \tfrac{\varepsilon}{2},
+\qquad \varepsilon = 0.05.
+\]
+The per-element focal BCE with positive-class weight $w_t$ is
+\[
+\ell_{i,t} = -\bigl[\,w_t\,\tilde y_{i,t} \log \hat p_{i,t}
+                  + (1-\tilde y_{i,t}) \log (1-\hat p_{i,t})\,\bigr]
+            \cdot (1-p^{\star}_{i,t})^{\gamma},
+\]
+where $p^{\star}_{i,t} = \hat p_{i,t}\,\tilde y_{i,t}
++ (1-\hat p_{i,t})(1-\tilde y_{i,t})$ is the probability assigned to
+the (smoothed) correct class, $\gamma = 2.0$ is the focusing
+parameter, and $w_t = \mathrm{clip}\!\bigl((1-r_t)/r_t,\,1,\,50\bigr)$
+with $r_t$ the empirical positive rate of tag $t$ in the training
+set. The total loss is $L = \tfrac{1}{NT}\sum_{i,t} \ell_{i,t}$.
+Negative samples are not drawn explicitly: every concept that does
+not appear in the next $\text{HORIZON}=20$ interactions is treated
+as a negative for that window, which gives an average positive rate
+of $\sim 1\%$ per tag and motivates the focal weighting.
+
+\subsection*{S5.7 Leakage audit}
+
+The 70/15/15 user-level split is fixed once per seed and shared by
+all agents. IRT calibration (Section~\ref{subsec3c}), the GraphSAGE
+embedding training, and prerequisite mining (Section~\ref{subsec3e})
+operate exclusively on the 4{,}200 training users. Validation and
+test users contribute neither to the IRT item parameters, nor to
+the mastery sequences fed into the prerequisite mining heuristics,
+nor to the GraphSAGE link-prediction objective. Tag embeddings
+exposed to the Prediction Agent through warm initialisation
+therefore contain no information about val/test responses, and the
+reported AUC-ROC is not inflated by topology-mediated leakage.
+
+\subsection*{S5.8 Reproduction command}
+
+\begin{verbatim}
+git clone https://anonymous.4open.science/r/mars-recsys-XXXX
+cd mars-recsys
+pip install -r requirements.txt
+
+# Full 5-seed main pipeline (~4-5 hours per seed on an RTX 5050):
+python scripts/run_multi_seed.py --seeds 42 123 456 789 2024
+
+# 5-seed inference-mode ablation (~75 min total):
+python scripts/run_ablation_inference_5seeds.py
+
+# Statistical tests + significance table:
+python scripts/ablation_significance.py
+
+# Confidence support + 6x6 matrix:
+python scripts/confidence_support_analysis.py
+
+# Per-tertile NDCG@10 for each config (seed 42, ~20 min):
+python scripts/tertile_ablation_s42.py
+
+# Post-hoc calibration (ECE / Brier / tertile):
+python scripts/posthoc_calibration.py
+
+# Sensitivity appendices (optional, ~6 h):
+python scripts/sensitivity_kg_thresholds.py
+python scripts/sensitivity_recommendation_weights.py
+python scripts/sensitivity_context_window.py
+\end{verbatim}

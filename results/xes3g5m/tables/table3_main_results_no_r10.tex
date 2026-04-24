@@ -1,0 +1,16 @@
+\begin{table}[t]
+\centering
+\caption{Main results on XES3G5M test set across five random seeds (mean $\pm$ std for MARS; baselines are deterministic or single-seed). R@10 is omitted because MARS evaluates on a filtered candidate pool, which makes recall not directly comparable with full-tag-pool baselines. AUC-ROC is reported only for sequence-based knowledge tracing models (DKT, GRU, MARS); for non-KT baselines (Random, Popularity, BPR-MF, CF-only, Content-only) the score vector is constant across users, which makes per-concept macro-AUC degenerate to 0.5 and not informative \textemdash{} those entries are marked as \textemdash.}
+\label{tab:main_results}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Metric & Random & Popularity & BPR-MF & CF-only & Content-only & DKT (LSTM) & GRU & MARS (ours) \\
+\midrule
+AUC & --- & --- & --- & --- & --- & 0.963 & 0.961 & \textbf{0.923 $\pm$ 0.005} \\
+NDCG@10 & 0.008 & 0.113 & 0.083 & 0.090 & 0.003 & 0.568 & 0.567 & \textbf{0.683 $\pm$ 0.023} \\
+P@10 & 0.004 & 0.051 & 0.045 & 0.044 & 0.002 & 0.235 & 0.236 & \textbf{0.640 $\pm$ 0.020} \\
+MRR & 0.012 & 0.149 & 0.093 & 0.122 & 0.004 & 0.625 & 0.623 & \textbf{0.893 $\pm$ 0.029} \\
+Cov. & 1.673 & 0.019 & 0.019 & 0.019 & 0.019 & 0.743 & 0.818 & \textbf{0.736 $\pm$ 0.024} \\
+\bottomrule
+\end{tabular}
+\end{table}

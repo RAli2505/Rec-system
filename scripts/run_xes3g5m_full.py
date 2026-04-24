@@ -378,6 +378,20 @@ def main():
     )
     logger.info("Data loaded: train=%d val=%d test=%d", len(train_df), len(val_df), len(test_df))
 
+    # Configure concept-space size from training data BEFORE any
+    # PredictionAgent / GapSequenceDataset / create_model call below.
+    # Hardcoding NUM_TAGS=293 (EdNet TOEIC default) silently dropped
+    # ~565 of XES3G5M's 858 concepts from labels.
+    from agents.prediction_agent import set_num_tags
+    train_max_id = 0
+    for tags in train_df["tags"]:
+        if isinstance(tags, list) and tags:
+            train_max_id = max(train_max_id, max(int(t) for t in tags))
+    n_tags = train_max_id + 1
+    logger.info("Concept-space: max_train_id=%d  ->  NUM_TAGS=%d",
+                train_max_id, n_tags)
+    set_num_tags(n_tags)
+
     # Build questions metadata — add EdNet-compatible dummy columns
     # that KG agent's build_graph expects but XES3G5M doesn't have.
     questions_df = build_xes3g5m_questions_df("data/xes3g5m/XES3G5M")

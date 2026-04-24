@@ -1,0 +1,36 @@
+% Appendix S6 — Hyperparameter grid.
+\section*{Appendix S6 — Hyperparameter grid}
+\label{appendix:s6}
+
+Prediction Agent (transformer):
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+Hyperparameter & Search grid & Selected (seed~42)\\
+\midrule
+seq\_len        & \{50, 100, 200\}            & 100\\
+n\_layers       & \{2, 4, 6\}                 & 4\\
+d\_model        & \{128, 256, 384\}           & 256\\
+num\_heads      & \{4, 8\}                    & 8\\
+dropout         & \{0.1, 0.2, 0.3\}           & 0.2\\
+learning rate   & \{1e-4, 3e-4, 1e-3\}        & 3e-4\\
+batch\_size     & \{64, 128\}                 & 128\\
+label smoothing & \{0.0, 0.05, 0.1\}          & 0.05\\
+focal $\gamma$  & \{1.0, 2.0, 3.0\}           & 2.0\\
+\bottomrule
+\end{tabular}
+\caption{Transformer hyperparameter search grid and selected values. Selection by validation AUC on seed~42; the resulting configuration is reused unchanged for all other seeds.}
+\label{tab:hyperparams_transformer}
+\end{table}
+
+KG prerequisite thresholds (from S2.1 sensitivity table above):
+$P(B|A) = 0.55$, $P(A|B) = 0.35$, $\min\text{co-occur} = 30$.
+
+Recommendation scoring weights (from S2.2 sensitivity table above):
+\texttt{gap\_weight} = 0.25, $\lambda_{\text{MMR}}$ = 0.80, \texttt{zpd\_bonus} = 0.10, \texttt{strategy\_score} = 0.45 (default in \texttt{configs/config.yaml}).
+
+Context window at inference: 100 interactions (from S2.3).
+
+Confidence skill-delta: $\pm 0.15$ for SOLID / CLEAR\_GAP, $\pm 0.10$ for FALSE\_CONFIDENCE / UNSURE\_CORRECT, $\pm 0.05$ for DOUBT classes; see Section~\ref{sec:confidence}. Robustness to these deltas is deferred to the camera-ready.

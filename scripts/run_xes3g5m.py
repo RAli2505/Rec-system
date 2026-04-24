@@ -33,10 +33,12 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from agents import prediction_agent as PA
 from agents.prediction_agent import (
     PredictionAgent, GapSequenceDataset, create_model,
-    NUM_TAGS, SEQ_LEN, HORIZON, BATCH_SIZE, DEVICE, NUM_WORKERS,
+    SEQ_LEN, HORIZON, BATCH_SIZE, DEVICE, NUM_WORKERS,
     LABEL_SMOOTHING, NUM_CONF_CLASSES,
+    set_num_tags,
 )
 from agents.utils import set_global_seed
 from data.xes3g5m_loader import load_xes3g5m
@@ -421,6 +423,18 @@ def main():
     for df in [train_df, val_df, test_df]:
         df["confidence_class"] = 0
     logger.info("Data loaded in %.1fs", time.time() - t0)
+
+    # Determine concept-space size from training data and configure model
+    # accordingly. Hardcoding NUM_TAGS=293 (EdNet TOEIC) silently dropped
+    # ~565 of XES3G5M's 858 concepts from labels.
+    train_max_id = 0
+    for tags in train_df["tags"]:
+        if isinstance(tags, list) and tags:
+            train_max_id = max(train_max_id, max(int(t) for t in tags))
+    n_tags = train_max_id + 1
+    logger.info("Concept-space: max_train_id=%d  ->  NUM_TAGS=%d",
+                train_max_id, n_tags)
+    set_num_tags(n_tags)  # MUST be called BEFORE building any dataset/model
 
     # Build datasets
     train_dataset = GapSequenceDataset(train_df)

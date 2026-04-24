@@ -1,0 +1,119 @@
+{
+  "class_distribution": {
+    "SOLID": 116700,
+    "UNSURE_CORRECT": 91061,
+    "FALSE_CONFIDENCE": 45879,
+    "CLEAR_GAP": 58619,
+    "DOUBT_CORRECT": 36650,
+    "DOUBT_INCORRECT": 41275
+  },
+  "per_class": [
+    {
+      "class": "SOLID",
+      "support": 116700,
+      "pct_of_total": 29.91,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    {
+      "class": "UNSURE_CORRECT",
+      "support": 91061,
+      "pct_of_total": 23.34,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    {
+      "class": "FALSE_CONFIDENCE",
+      "support": 45879,
+      "pct_of_total": 11.76,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    {
+      "class": "CLEAR_GAP",
+      "support": 58619,
+      "pct_of_total": 15.02,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    {
+      "class": "DOUBT_CORRECT",
+      "support": 36650,
+      "pct_of_total": 9.39,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    {
+      "class": "DOUBT_INCORRECT",
+      "support": 41275,
+      "pct_of_total": 10.58,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    }
+  ],
+  "confusion_matrix_classes": [
+    "SOLID",
+    "UNSURE_CORRECT",
+    "FALSE_CONFIDENCE",
+    "CLEAR_GAP",
+    "DOUBT_CORRECT",
+    "DOUBT_INCORRECT"
+  ],
+  "confusion_matrix": [
+    [
+      116700,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      91061,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      45879,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      58619,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      36650,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      41275
+    ]
+  ],
+  "note": "Rule-based classifier: matrix is diagonal by construction; F1=1.0 is tautological."
+}

@@ -89,35 +89,137 @@ ednet-mars/
 ## Setup
 
 ```bash
+# Python 3.12.x recommended (tested on 3.12.2, Windows 11 + CUDA 12.8)
+python -m pip install --upgrade pip
+
+# PyTorch — install with the official CUDA wheel index BEFORE the rest:
+pip install torch==2.11.0+cu128 torchvision==0.26.0+cu128 \
+            torchaudio==2.11.0+cu128 \
+            --index-url https://download.pytorch.org/whl/cu128
+
+# Then the rest of the pinned environment:
 pip install -r requirements.txt
 ```
 
-## Running
+## Datasets
 
 ```bash
-# Full pipeline with confidence synthesis (XES3G5M)
+# XES3G5M (~360 MB tar.gz, contains kc_level/, question_level/, metadata/)
+mkdir -p data/xes3g5m
+# Download manually from https://github.com/ai4ed/XES3G5M and extract:
+tar -xzf XES3G5M.tar.gz -C data/xes3g5m/
+# Result: data/xes3g5m/XES3G5M/kc_level/train_valid_sequences.csv
+
+# EdNet KT2 (already in data/raw/ for the comparable evaluation)
+```
+
+## Reproducing the paper results
+
+### Full reproduction pipeline (~9 hours wall-clock on a single GPU)
+
+```bash
+# 1. Trains MARS on 5 random seeds, then runs baselines and the
+#    component ablation. Logs go to logs/retrain_NUMTAGS858_<ts>/.
+bash scripts/retrain_xes3g5m_pipeline.sh
+
+# 2. Aggregates raw metrics into the 3 paper tables and regenerates
+#    every downstream figure / LaTeX table. Run once the pipeline has
+#    finished (the sentinel chain triggers it automatically — see
+#    scripts/watch_and_postprocess.sh).
+bash scripts/postprocess_xes3g5m.sh
+```
+
+### Individual components
+
+```bash
+# A single seed of the full multi-agent pipeline
 python scripts/run_xes3g5m_full.py --seed 42
 
-# Multi-seed evaluation (5 seeds)
-python scripts/run_multi_seed.py
+# 4 baselines (Random / Popularity / DKT-LSTM / GRU)
+python scripts/run_xes3g5m_baselines.py --seed 42
 
-# Baselines
-python scripts/run_xes3g5m_baselines.py
+# 3 extra baselines (BPR-MF / CF-only / Content-only)
+python scripts/run_extra_baselines.py --seed 42
 
-# Ablation study
-python scripts/run_xes3g5m_ablation.py
+# Component ablation (4 configs after Full MARS reuse)
+python scripts/run_xes3g5m_ablation.py --seed 42
 
-# Generate figures
-python scripts/generate_ieee_figures.py
-python scripts/generate_xes3g5m_figures.py
-python scripts/generate_architecture_figs.py
+# Subgroup analysis on saved best.pt (low/mid/high tertiles)
+python scripts/subgroup_xes3g5m.py
 ```
+
+### Reproducing every paper figure / table from the saved JSONs
+
+```bash
+# 1. Build the 3 source CSVs:
+python scripts/aggregate_xes3g5m.py
+
+# 2. Regenerate every downstream artefact:
+python scripts/generate_paper_alt_figures.py   # Figs 3 (heatmap), 4 (ablation), CD diagram
+python scripts/generate_radar.py               # Fig 8
+python scripts/generate_seed_table.py          # Table 5
+python scripts/generate_table3_no_r10.py       # Table 3 (LaTeX + Markdown)
+python scripts/generate_cross_dataset.py       # Fig 9 (cross-dataset bars)
+python scripts/generate_training_curves.py     # Figs 6 + 7 (loss + AUC)
+python scripts/ablation_pareto_analysis.py     # Pareto-frontier figure for §4.5
+python scripts/subgroup_xes3g5m.py             # Fig 5 (subgroup bars)
+```
+
+## Random seeds
+
+All five random seeds used in the paper are baked into the orchestrator
+script: **42, 123, 456, 789, 2024**. They control:
+
+- the user-level 70/15/15 split inside `data/xes3g5m_loader.py`;
+- the PyTorch / NumPy initialisation through `agents/utils.set_global_seed()`;
+- the Thompson Sampling Beta-priors inside the Recommendation Agent;
+- the negative-sampling order in the BPR baseline.
+
+The same seeds are used on EdNet (`scripts/run_ednet_comparable.py`)
+to keep the 5-seed stability tables comparable across datasets.
+
+## Concept-space (NUM_TAGS) configuration
+
+The original codebase hard-coded `NUM_TAGS = 293` (EdNet TOEIC) in
+`agents/prediction_agent.py`. For XES3G5M (858 concepts) this silently
+clipped concept IDs above 293 and degraded coverage. The current
+release derives `NUM_TAGS` dynamically from the training split:
+
+```python
+train_max_id = max(int(t) for tags in train_df["tags"]
+                   for t in tags if tags)
+n_tags = train_max_id + 1
+set_num_tags(n_tags)   # → 858 for XES3G5M, 293 for EdNet
+```
+
+This is performed automatically by `run_xes3g5m_*.py` and
+`run_ednet_comparable.py`; manual invocation is not needed.
 
 ## Configuration
 
-All hyperparameters are centralized in `configs/config.yaml`.
-Agents load their section automatically via `BaseAgent._load_config()`.
+All hyperparameters are centralised in `configs/config.yaml`. Agents
+load their section automatically via `BaseAgent._load_config()`. Any
+override is picked up at agent construction time.
+
+## Hardware used in the paper
+
+- GPU: NVIDIA GeForce RTX 5050 Laptop (8 GB), driver 573.13, CUDA 12.8
+- CPU: Intel-class laptop, 32 GB RAM
+- OS: Windows 11 Pro 24H2, Git Bash 2.49 + PowerShell 5.1
+- Python: 3.12.2 (Microsoft Store distribution)
+
+Single-seed wall-clock: MARS pipeline ≈ 45–60 min; baselines ≈ 90 min
+(includes DKT and GRU training); ablation ≈ 3 hours (4 configs after
+reusing Full MARS metrics from the main pipeline run).
 
 ## Citation
 
-[will be added after publication]
+```bibtex
+@article{ali2026mars,
+  title  = {A Multi-Agent Recommendation System for Personalized Learning
+            with Behavioral Confidence Modeling and Data-Driven Prerequisite Mining},
+  author = {Ali, Ramazan and Stelvaga, Oleg},
+  year   = {2026},
+  journal= {Submitted}
+}
+```

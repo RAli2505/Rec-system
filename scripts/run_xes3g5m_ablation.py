@@ -221,6 +221,16 @@ def main():
     for df in [train_df, val_df, test_df]:
         df["confidence_class"] = 0
 
+    # Configure NUM_TAGS dynamically from train data BEFORE any dataset/model build.
+    from agents.prediction_agent import set_num_tags
+    train_max_id = 0
+    for tags in train_df["tags"]:
+        if isinstance(tags, list) and tags:
+            train_max_id = max(train_max_id, max(int(t) for t in tags))
+    n_tags = train_max_id + 1
+    logger.info("Concept-space: max_train_id=%d  ->  NUM_TAGS=%d", train_max_id, n_tags)
+    set_num_tags(n_tags)
+
     questions_df = build_xes3g5m_questions_df("data/xes3g5m/XES3G5M")
     if "bundle_id" not in questions_df.columns:
         questions_df["bundle_id"] = questions_df["question_id"]
@@ -231,8 +241,11 @@ def main():
     lectures_df = pd.DataFrame({"lecture_id": [], "tags": [], "part_id": [],
                                  "type_of": [], "bundle_id": []})
 
+    # "Full MARS" is reused from the existing main-pipeline run for this seed
+    # (run_xes3g5m_full.py output) to avoid retraining the full system here —
+    # those metrics are identical given the same seed and same data split.
+    # Only the agent-disabled configurations are trained from scratch.
     configs = [
-        ("Full MARS", {}),
         ("- Prediction", {"disable_prediction": True}),
         ("- Knowledge Graph", {"disable_kg": True}),
         ("- Confidence", {"disable_confidence": True}),
@@ -240,6 +253,31 @@ def main():
     ]
 
     results = {}
+
+    # Load Full MARS metrics from the most recent main-pipeline run for this seed.
+    import glob
+    import os
+    full_paths = sorted(
+        glob.glob(str(ROOT / f"results/xes3g5m/xes3g5m_full_s{args.seed}_*/metrics.json")),
+        key=os.path.getmtime, reverse=True,
+    )
+    if full_paths:
+        with open(full_paths[0]) as f:
+            full_run = json.load(f)
+        full_eval = full_run.get("eval_metrics", {})
+        # Tag the row with where it came from so the lineage is traceable.
+        full_eval["_reused_from"] = str(Path(full_paths[0]).parent.name)
+        full_eval["time_s"] = 0.0  # no time spent re-training in this script
+        results["Full MARS"] = full_eval
+        logger.info("Reusing Full MARS metrics from %s", full_paths[0])
+    else:
+        logger.warning(
+            "No main-pipeline run found for seed=%d at "
+            "results/xes3g5m/xes3g5m_full_s%d_* — Full MARS row will be missing. "
+            "Run scripts/run_xes3g5m_full.py --seed %d first.",
+            args.seed, args.seed, args.seed,
+        )
+
     for name, kwargs in configs:
         t0 = time.time()
         metrics = run_ablation_config(

@@ -1,0 +1,20 @@
+\begin{table}[t]
+\centering
+\caption{Per-seed test metrics for MARS on XES3G5M across five random seeds. CV denotes the coefficient of variation (std/mean $\times$ 100).}
+\label{tab:seed_stability_full}
+\begin{tabular}{lrrrrr}
+\toprule
+Seed & AUC-ROC & NDCG@10 & P@10 & MRR & Coverage \\
+\midrule
+42 & 0.9176 & 0.6540 & 0.6172 & 0.8546 & 0.7353 \\
+123 & 0.9231 & 0.6865 & 0.6468 & 0.8969 & 0.7391 \\
+456 & 0.9315 & 0.7177 & 0.6700 & 0.9305 & 0.7139 \\
+789 & 0.9204 & 0.6717 & 0.6321 & 0.8759 & 0.7159 \\
+2024 & 0.9247 & 0.6840 & 0.6332 & 0.9067 & 0.7744 \\
+\midrule
+Mean $\pm$ Std & 0.9235 $\pm$ 0.0052 & 0.6828 $\pm$ 0.0234 & 0.6399 $\pm$ 0.0198 & 0.8929 $\pm$ 0.0291 & 0.7357 $\pm$ 0.0244 \\
+Min / Max & 0.9176 / 0.9315 & 0.6540 / 0.7177 & 0.6172 / 0.6700 & 0.8546 / 0.9305 & 0.7139 / 0.7744 \\
+CV (\%) & 0.57 & 3.42 & 3.10 & 3.25 & 3.31 \\
+\bottomrule
+\end{tabular}
+\end{table}

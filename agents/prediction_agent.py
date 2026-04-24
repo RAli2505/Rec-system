@@ -41,9 +41,30 @@ logger = logging.getLogger("mars.agent.prediction")
 # Constants
 # ──────────────────────────────────────────────────────────
 
-NUM_TAGS = 293
+NUM_TAGS = 293          # default = EdNet TOEIC; override via set_num_tags() for other datasets
 NUM_PARTS = 7           # TOEIC parts 1-7
 NUM_CONF_CLASSES = DEFAULT_CONFIDENCE_N_CLASSES
+
+
+def set_num_tags(n: int) -> None:
+    """Override the global NUM_TAGS used by all subsequently-built datasets
+    and models in this module.
+
+    Call this BEFORE constructing any ``GapSequenceDataset`` or ``create_model``
+    when training on a dataset whose concept-space differs from EdNet
+    (e.g. XES3G5M has 858 concepts, not 293). Existing instances are not
+    retroactively updated.
+
+    Parameters
+    ----------
+    n : int
+        New concept-space size. Must be >= 1.
+    """
+    global NUM_TAGS
+    if n < 1:
+        raise ValueError(f"num_tags must be >= 1, got {n}")
+    NUM_TAGS = int(n)
+    logger.info("NUM_TAGS set to %d", NUM_TAGS)
 SEQ_LEN = 100           # window of recent interactions (was 50 → more context)
 HORIZON = 20            # predict failures within next N questions (wider = more signal)
 MAX_TAGS_PER_STEP = 7   # max tags per question in EdNet
@@ -67,7 +88,10 @@ PATIENCE = 8            # more patience — let scheduler find better minima
 #                                steps_since_last_tag, cumulative_accuracy]
 # = 7 + 7 = 14 columns
 FEATURES_PER_STEP = MAX_TAGS_PER_STEP + 7  # 14
-NUM_WORKERS = 0 if __import__("sys").platform == "win32" else 4
+NUM_WORKERS = int(__import__("os").getenv(
+    "MARS_NUM_WORKERS",
+    "2" if __import__("sys").platform == "win32" else "4",
+))
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

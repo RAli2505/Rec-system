@@ -42,49 +42,87 @@ def draw_arrow(ax, x1, y1, x2, y2, label='', color='#2C3E50', label_offset=(0.12
 
 
 # =====================================================
-# FIG 1: MARS System Architecture
+# FIG 1: MARS System Architecture (clean pipeline-oriented)
 # =====================================================
-fig, ax = plt.subplots(figsize=(DOUBLE_COL, 5.2))
-ax.set_xlim(-0.3, 7.5)
-ax.set_ylim(-1.3, 5.3)
+# Three-column layout: each column = one pipeline, agents listed in execution order.
+# No orchestrator frame, no arrow labels, uniform arrows.
+ARROW_KW = dict(arrowstyle='-|>', color='#2C3E50', lw=1.0,
+                mutation_scale=10, shrinkA=2, shrinkB=2)
+
+
+def uarrow(ax, x1, y1, x2, y2):
+    ax.annotate('', xy=(x2, y2), xytext=(x1, y1), arrowprops=ARROW_KW)
+
+
+AGENT_DESC = {
+    'Diagnostic':      'IRT 3PL + CAT',
+    'Confidence':      'Rule-based 6-class',
+    'KnowledgeGraph':  'GraphSAGE + Prereq.',
+    'Prediction':      'SAINT Transformer',
+    'Personalization': 'IRT 5-level strat.',
+    'Recommendation':  'Thompson + MMR',
+}
+
+fig, ax = plt.subplots(figsize=(DOUBLE_COL, 6.6))
+ax.set_xlim(-0.2, 8.2)
+ax.set_ylim(-1.8, 5.8)
 ax.axis('off')
 
-# Input
-draw_box(ax, 0.5, 4.6, 6.2, 0.5, 'Datasets\nEdNet KT2 (TOEIC) + XES3G5M (Math)', '#AED6F1', '#5DADE2')
+# --- Input row (shared) ---
+draw_box(ax, 1.0, 5.1, 6.0, 0.5, 'Datasets: EdNet KT2 (TOEIC) + XES3G5M (Math)',
+         '#AED6F1', '#5DADE2')
 
-# Orchestrator frame
-rect = mpatches.FancyBboxPatch((0.2, 0.1), 6.8, 4.1, boxstyle="round,pad=0.1",
-                                 facecolor='#FAFAFA', edgecolor='#2C3E50', linewidth=1.5, linestyle='--')
-ax.add_patch(rect)
-ax.text(3.6, 4.05, 'ORCHESTRATOR', ha='center', fontsize=10, fontweight='bold', color='#2C3E50')
+# --- Three pipeline columns ---
+COL_W, COL_GAP = 2.4, 0.35
+COL_X = [0.2 + i*(COL_W + COL_GAP) for i in range(3)]
 
-# Pipelines row
-for i, (name, col) in enumerate([('Cold-Start', '#D6EAF8'), ('Assessment', '#D5F5E3'), ('Continuous', '#FDEBD0')]):
-    draw_box(ax, 0.5 + i*2.2, 3.45, 1.8, 0.35, name, col, '#888', fontsize=7)
+pipelines = [
+    ('Cold-Start Pipeline',  '#D6EAF8', '#5DADE2',
+     ['Diagnostic', 'KnowledgeGraph', 'Recommendation']),
+    ('Assessment Pipeline',  '#D5F5E3', '#27AE60',
+     ['Diagnostic', 'Confidence', 'KnowledgeGraph',
+      'Prediction', 'Personalization', 'Recommendation']),
+    ('Continuous Pipeline',  '#FDEBD0', '#E67E22',
+     ['Prediction', 'Recommendation']),
+]
 
-# Row 1: Diagnostic + Confidence  (y = 2.5 .. 3.2)
-draw_box(ax, 0.5, 2.5, 2.8, 0.7, 'DiagnosticAgent\nIRT 3PL + CAT\ntheta estimation', '#EBF0F5', '#5B7BA0')
-draw_box(ax, 3.9, 2.5, 2.8, 0.7, 'ConfidenceAgent\nRule-based 6-class\nbehavioral confidence', '#EBF0F5', '#5B7BA0')
+STEP_H, STEP_GAP = 0.55, 0.22
+TOP_Y = 4.35  # title box top sits here
 
-# Row 2: KG + Prediction  (y = 1.4 .. 2.1)
-draw_box(ax, 0.5, 1.4, 2.8, 0.7, 'KnowledgeGraphAgent\nGraphSAGE + Prerequisites\ngap_tags, prereq_map', '#EBF0F5', '#5B7BA0')
-draw_box(ax, 3.9, 1.4, 2.8, 0.7, 'PredictionAgent\nSAINT Transformer 4L/256d\n293-dim gap_probs', '#EBF0F5', '#5B7BA0')
+for i, (title, bg, border, agents) in enumerate(pipelines):
+    x = COL_X[i]
+    # Title box
+    draw_box(ax, x, TOP_Y, COL_W, 0.45, title, bg, border, fontsize=8)
 
-# Row 3: Recommendation + Personalization  (y = 0.3 .. 1.0)
-draw_box(ax, 0.5, 0.3, 3.3, 0.7, 'RecommendationAgent\nThompson Sampling + 6-feature scoring\nMMR diversity + prereq filter', '#E8DAEF', '#8E44AD')
-draw_box(ax, 4.3, 0.3, 2.4, 0.7, 'PersonalizationAgent\nIRT 5-level stratification', '#EBF0F5', '#5B7BA0')
+    # Agent boxes in execution order
+    prev_center = None
+    for si, name in enumerate(agents):
+        y = TOP_Y - 0.25 - (si + 1) * (STEP_H + STEP_GAP)
+        fill   = '#E8DAEF' if name == 'Recommendation' else '#F5F5F5'
+        bcolor = '#8E44AD' if name == 'Recommendation' else '#9FB2C6'
+        label = f'{name}Agent\n{AGENT_DESC[name]}'
+        draw_box(ax, x + 0.1, y, COL_W - 0.2, STEP_H, label, fill, bcolor, fontsize=7)
+        cx = x + COL_W / 2
+        top = y + STEP_H
+        if prev_center is not None:
+            # uniform vertical arrow between consecutive agent boxes
+            uarrow(ax, cx, prev_center, cx, top)
+        prev_center = y  # bottom of current box for next arrow
 
-# Arrows (vertical gaps are 0.3 wide, enough room for labels)
-draw_arrow(ax, 3.6, 4.6, 3.6, 4.22)                               # input -> orchestrator
-draw_arrow(ax, 1.9, 2.5, 1.9, 2.12, 'theta')                      # diag -> KG
-draw_arrow(ax, 5.3, 2.5, 5.3, 2.12, 'conf_class')                 # conf -> pred
-draw_arrow(ax, 1.9, 1.4, 1.9, 1.02, 'prereq_map')                 # KG -> rec
-draw_arrow(ax, 5.0, 1.4, 3.5, 1.02, 'gap_probs', label_offset=(0.08, 0.08))  # pred -> rec (diagonal)
-draw_arrow(ax, 5.5, 0.3, 5.5, -0.12)                              # pers -> out
+# Dataset -> top of every pipeline title
+for x in COL_X:
+    uarrow(ax, x + COL_W/2, 5.1, x + COL_W/2, TOP_Y + 0.45)
 
-# Output
-draw_box(ax, 1.5, -0.6, 4.2, 0.35, 'Personalized Recommendation List (Top-K)', '#A9DFBF', '#27AE60')
-draw_arrow(ax, 2.2, 0.3, 2.8, -0.22)                              # rec -> out
+# --- Output row (shared) ---
+last_y = TOP_Y - 0.25 - (6) * (STEP_H + STEP_GAP)  # bottom of Assessment (deepest column)
+out_y = last_y - 0.25
+draw_box(ax, 1.0, out_y - 0.45, 6.0, 0.45,
+         'Personalized Recommendation List (Top-K)', '#A9DFBF', '#27AE60')
+# Arrow from each pipeline's last agent to output
+for i, (_, _, _, agents) in enumerate(pipelines):
+    depth = len(agents)
+    bottom_y = TOP_Y - 0.25 - depth * (STEP_H + STEP_GAP)
+    uarrow(ax, COL_X[i] + COL_W/2, bottom_y, COL_X[i] + COL_W/2, out_y - 0.0)
 
 fig.savefig(FDIR / 'fig1_mars_architecture.png', dpi=600, bbox_inches='tight')
 fig.savefig(FDIR / 'fig1_mars_architecture.pdf', bbox_inches='tight')
@@ -173,5 +211,120 @@ fig.savefig(FDIR / 'fig4_orchestrator_pipelines.png', dpi=600, bbox_inches='tigh
 fig.savefig(FDIR / 'fig4_orchestrator_pipelines.pdf', bbox_inches='tight')
 plt.close()
 print('OK: fig4_orchestrator_pipelines')
+
+
+# =====================================================
+# FIG 11: MARS detailed architecture (Backbone/Neck/Head style)
+# =====================================================
+ARROW_KW2 = dict(arrowstyle='-|>', color='#2C3E50', lw=0.9,
+                 mutation_scale=9, shrinkA=2, shrinkB=2)
+
+
+def arr(ax, x1, y1, x2, y2):
+    ax.annotate('', xy=(x2, y2), xytext=(x1, y1), arrowprops=ARROW_KW2)
+
+
+def panel(ax, x, y, w, h, title, bg='#F7F7F7', border='#B0B0B0'):
+    """Outer group panel with a dedicated title band at the top."""
+    rect = mpatches.FancyBboxPatch((x, y), w, h, boxstyle='round,pad=0.05',
+                                   facecolor=bg, edgecolor=border,
+                                   linewidth=1.0)
+    ax.add_patch(rect)
+    # Title band (solid color strip at top, so title never overlaps content)
+    band_h = 0.38
+    band = FancyBboxPatch((x + 0.02, y + h - band_h - 0.02), w - 0.04, band_h,
+                          boxstyle='round,pad=0.02',
+                          facecolor=border, edgecolor=border, linewidth=0)
+    ax.add_patch(band)
+    ax.text(x + w/2, y + h - band_h/2 - 0.02, title, ha='center', va='center',
+            fontsize=8, fontweight='bold', color='white')
+
+
+def minibox(ax, x, y, w, h, text, fill='#FFFFFF', border='#9FB2C6', fontsize=6):
+    box = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.03",
+                         facecolor=fill, edgecolor=border, linewidth=0.8)
+    ax.add_patch(box)
+    ax.text(x + w/2, y + h/2, text, ha='center', va='center',
+            fontsize=fontsize, color='#2C3E50')
+
+
+# ----------- clean agent-flow diagram (no detail panels / no groupings) -----------
+fig, ax = plt.subplots(figsize=(13, 5.5))
+ax.set_xlim(0, 20)
+ax.set_ylim(0, 8)
+ax.axis('off')
+
+# Title
+ax.text(10, 7.6, 'MARS - Multi-Agent Pipeline',
+        ha='center', va='center', fontsize=11, fontweight='bold', color='#2C3E50')
+
+# Each block: (x, y, w, h, name, summary, arrow-label-above)
+BH = 1.4
+BW = 2.4
+ROW_Y = 3.4
+BLOCKS = [
+    ('Input\nDataset',          'XES3G5M + EdNet\n6K users',               '#AED6F1', '#5DADE2'),
+    ('DiagnosticAgent',         'IRT 3PL + CAT\n-> theta',                 '#EBF0F5', '#5B7BA0'),
+    ('ConfidenceAgent',         '6-class rules\n-> conf_class',            '#EBF0F5', '#5B7BA0'),
+    ('KnowledgeGraphAgent',     'GraphSAGE + prereq.\n-> gap_tags',        '#EBF0F5', '#5B7BA0'),
+    ('PredictionAgent',         'SAINT Transformer\n-> gap_probs[293]',    '#EBF0F5', '#5B7BA0'),
+    ('PersonalizationAgent',    'IRT 5-level\n-> learner level',           '#EBF0F5', '#5B7BA0'),
+    ('RecommendationAgent',     'Thompson + MMR\n+ LambdaMART',            '#E8DAEF', '#8E44AD'),
+    ('Top-K\nRecommendation',   'prereq-filtered\nranked list',            '#A9DFBF', '#27AE60'),
+]
+
+# Two rows of 4 blocks each with clear gaps
+GAP_X = 0.2
+for i, (name, desc, fill, border) in enumerate(BLOCKS):
+    row = i // 4            # 0 = top row, 1 = bottom row
+    col = i % 4
+    y = ROW_Y if row == 1 else ROW_Y + BH + 1.2
+    x = 0.4 + col * (BW + GAP_X * 2 + 0.6)
+
+    # small-bordered rounded rectangle (not long borders, not touching)
+    box = FancyBboxPatch((x, y), BW, BH, boxstyle='round,pad=0.06',
+                         facecolor=fill, edgecolor=border, linewidth=1.0)
+    ax.add_patch(box)
+    ax.text(x + BW/2, y + BH - 0.30, name,
+            ha='center', va='center', fontsize=8.5, fontweight='bold',
+            color='#2C3E50')
+    ax.text(x + BW/2, y + BH/2 - 0.35, desc,
+            ha='center', va='center', fontsize=7, style='italic',
+            color='#444')
+
+# ---- arrows between blocks ----
+# top row left->right (indices 0..3)
+for i in range(3):
+    x1 = 0.4 + i * (BW + GAP_X * 2 + 0.6) + BW
+    x2 = 0.4 + (i + 1) * (BW + GAP_X * 2 + 0.6)
+    y = ROW_Y + BH + 1.2 + BH/2
+    arr(ax, x1 + 0.05, y, x2 - 0.05, y)
+
+# top row last (i=3) -> bottom row first (i=4): vertical turn arrow
+x_end_top = 0.4 + 3 * (BW + GAP_X * 2 + 0.6) + BW/2
+x_start_bot = 0.4 + 0 * (BW + GAP_X * 2 + 0.6) + BW/2
+y_top = ROW_Y + BH + 1.2            # bottom edge of top row
+y_bot = ROW_Y + BH                  # top edge of bottom row
+
+# draw a U-turn: down from end-of-top, left, then down into start-of-bottom
+# simplified: one diagonal arrow
+arr(ax, x_end_top, y_top, x_start_bot, y_bot + 0.15)
+# also add a small tag near the turning arrow so the flow is clear
+ax.text((x_end_top + x_start_bot) / 2, (y_top + y_bot) / 2 + 0.05,
+        'continue',
+        ha='center', va='center', fontsize=7, style='italic', color='#777')
+
+# bottom row left->right (indices 4..7)
+for i in range(4, 7):
+    x1 = 0.4 + (i - 4) * (BW + GAP_X * 2 + 0.6) + BW
+    x2 = 0.4 + (i - 4 + 1) * (BW + GAP_X * 2 + 0.6)
+    y = ROW_Y + BH/2
+    arr(ax, x1 + 0.05, y, x2 - 0.05, y)
+
+fig.savefig(FDIR / 'fig_mars_detailed_arch.png', dpi=600, bbox_inches='tight')
+fig.savefig(FDIR / 'fig_mars_detailed_arch.pdf', bbox_inches='tight')
+plt.close()
+print('OK: fig_mars_detailed_arch')
+
 
 print(f'\nArchitecture figures saved to {FDIR}')
