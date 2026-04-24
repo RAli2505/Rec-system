@@ -66,7 +66,9 @@ Datasets (not included due to license):
   and unpack to `data/xes3g5m/XES3G5M`.
 - **EdNet KT2.** Download from
   [https://github.com/riiid/ednet](https://github.com/riiid/ednet)
-  and unpack to `data/ednet/KT2`.
+  and unpack to `data/raw/KT2/`. The loader
+  (`data/ednet_comparable_loader.py`) samples 6,000 students at load
+  time, matching the XES3G5M evaluation protocol.
 
 Main experiments (single command each):
 

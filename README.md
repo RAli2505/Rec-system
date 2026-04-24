@@ -4,8 +4,8 @@ A multi-agent recommender system that combines IRT-based diagnostics, knowledge 
 
 ## Datasets
 
-- **EdNet KT2** -- TOEIC English proficiency (20K users)
-- **XES3G5M** -- Math knowledge tracing (6K users) -- [github.com/ai4ed/XES3G5M](https://github.com/ai4ed/XES3G5M?tab=readme-ov-file)
+- **EdNet KT2** -- TOEIC English proficiency. Raw corpus contains 784K students and 131M+ interactions; for the cross-dataset comparison in this paper the pipeline is retrained on a 6,000-student resample (min 20 interactions, user-level 70/15/15 split) so that the evaluation protocol matches XES3G5M one-to-one. Download: [github.com/riiid/ednet](https://github.com/riiid/ednet)
+- **XES3G5M** -- Math knowledge tracing. 6,000-student resample, 858 concepts, 7,373 questions, same 70/15/15 user-level split. Download: [github.com/ai4ed/XES3G5M](https://github.com/ai4ed/XES3G5M?tab=readme-ov-file)
 
 ## Architecture
 
@@ -110,7 +110,13 @@ mkdir -p data/xes3g5m
 tar -xzf XES3G5M.tar.gz -C data/xes3g5m/
 # Result: data/xes3g5m/XES3G5M/kc_level/train_valid_sequences.csv
 
-# EdNet KT2 (already in data/raw/ for the comparable evaluation)
+# EdNet KT2 — download the raw KT2 tarball from github.com/riiid/ednet
+# and extract to data/raw/KT2/. The loader
+# (data/ednet_comparable_loader.py) then samples 6,000 students on
+# the fly to match the XES3G5M protocol.
+mkdir -p data/raw
+# wget https://raw.githubusercontent.com/riiid/ednet/master/... # see
+# EdNet README for the current download URL; the KT2 tarball is ~10 GB.
 ```
 
 ## Reproducing the paper results
