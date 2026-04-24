@@ -16,7 +16,7 @@ A multi-agent recommender system that combines IRT-based diagnostics, knowledge 
 | DiagnosticAgent | IRT 3PL + CAT | Ability estimation (theta) |
 | ConfidenceAgent | Rule-based 6-class | Behavioral confidence classification |
 | KGAgent | GraphSAGE + DAG | Knowledge graph embeddings + prerequisite mining |
-| PredictionAgent | SAINT Transformer 4L/256d | Knowledge gap prediction (293-dim gap vector) |
+| PredictionAgent | SAINT Transformer 4L/256d | Knowledge gap prediction (dataset-dependent gap vector — 858 concepts on XES3G5M, 293 on EdNet KT2) |
 | RecommendationAgent | Thompson Sampling + Weighted Linear | Multi-strategy recommendation + MMR diversity |
 | PersonalizationAgent | IRT rule-based 5-level | Learner stratification |
 | Orchestrator | Rule-based | Pipeline coordination |
@@ -38,7 +38,7 @@ ednet-mars/
 |   |-- diagnostic_agent.py     # IRT 3PL + CAT, theta ability estimation
 |   |-- confidence_agent.py     # Rule-based 6-class behavioral confidence
 |   |-- kg_agent.py             # GraphSAGE embeddings + prerequisite mining
-|   |-- prediction_agent.py     # SAINT Transformer 4L/256d, 293-dim gap vector
+|   |-- prediction_agent.py     # SAINT Transformer 4L/256d, dataset-dependent gap vector (858 on XES3G5M, 293 on EdNet)
 |   |-- recommendation_agent.py # Thompson Sampling + weighted linear, MMR diversity
 |   |-- personalization_agent.py# IRT rule-based 5-level learner stratification
 |   |-- baselines.py            # Random, Popularity, DKT, GRU baselines
