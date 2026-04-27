@@ -1,0 +1,26 @@
+{
+  "DTransformer": {
+    "test_auc_macro": 0.966,
+    "test_auc_weighted": 0.9594,
+    "test_f1_micro": 0.0119,
+    "ndcg@10": 0.5643,
+    "precision@10": 0.2329,
+    "recall@10": 0.7011,
+    "mrr": 0.6186,
+    "tag_coverage": 0.7996,
+    "question_coverage": 0.4873,
+    "diversity": 1.0,
+    "novelty": -0.1219,
+    "learning_gain": 0.028,
+    "learning_gain_std": 0.0914,
+    "learning_gain_trimmed": 0.0282,
+    "n_eval_tags": 504,
+    "n_eval_users": 17817,
+    "model": "DTransformer",
+    "seed": 123,
+    "n_params": 3774712,
+    "val_auc": 0.95,
+    "best_epoch": 17,
+    "runtime_s": 3514.2
+  }
+}

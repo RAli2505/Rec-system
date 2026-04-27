@@ -1,0 +1,14 @@
+{
+  "model": "AKT",
+  "seed": 123,
+  "n_params": 3269130,
+  "n_questions": 7128,
+  "n_concepts": 866,
+  "val_auc": 0.848,
+  "test_auc": 0.8488,
+  "test_accuracy": 0.8449,
+  "test_brier": 0.1118,
+  "best_epoch": 20,
+  "n_test_steps": 316058,
+  "runtime_s": 605.0
+}

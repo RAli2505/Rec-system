@@ -1,0 +1,14 @@
+{
+  "model": "SAINTPlus",
+  "seed": 789,
+  "n_params": 14523649,
+  "n_questions": 7197,
+  "n_concepts": 866,
+  "val_auc": 0.8295,
+  "test_auc": 0.8331,
+  "test_accuracy": 0.8347,
+  "test_brier": 0.1195,
+  "best_epoch": 4,
+  "n_test_steps": 312847,
+  "runtime_s": 121.6
+}

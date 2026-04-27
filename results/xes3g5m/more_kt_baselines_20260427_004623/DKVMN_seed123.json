@@ -1,0 +1,14 @@
+{
+  "model": "DKVMN",
+  "seed": 123,
+  "n_params": 953857,
+  "n_questions": 7128,
+  "n_concepts": 866,
+  "val_auc": 0.8041,
+  "test_auc": 0.806,
+  "test_accuracy": 0.8296,
+  "test_brier": 0.1242,
+  "best_epoch": 20,
+  "n_test_steps": 316058,
+  "runtime_s": 341.7
+}

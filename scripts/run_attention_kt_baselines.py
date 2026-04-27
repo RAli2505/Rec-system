@@ -86,7 +86,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("attn_kt_baselines")
 
 DEFAULT_SEEDS = [42, 123, 456, 789, 2024]
-DEFAULT_MODELS = ["SAINT", "AKT", "SimpleKT"]
+DEFAULT_MODELS = ["SAINT", "AKT", "SimpleKT", "DTransformer"]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -307,6 +307,82 @@ class SimpleKT(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 4. DTransformer — Diagnostic Transformer (Yin et al., WWW 2023)
+# ─────────────────────────────────────────────────────────────────────
+
+class DTransformer(nn.Module):
+    """Diagnostic Transformer (Yin et al., WWW 2023): "Tracing knowledge
+    instead of patterns".
+
+    Core idea: extract a stable knowledge state from the encoded
+    sequence by cross-attending against a small set of learnable
+    knowledge anchor queries. The diagnostic decoder treats those
+    anchors as concept prototypes, yielding a knowledge-state vector
+    that resists the "pattern memorisation" failure mode common in
+    plain causal transformers.
+
+    Implementation notes
+    --------------------
+    pykt-toolkit 0.0.38 does not include DTransformer, so we implement
+    a faithful but minimal variant on the same 14-dim per-step input
+    used by the other A-style baselines (SAINT, AKT, SimpleKT). All
+    four therefore share the StepEmbedder and the per-concept output
+    head, isolating the attention/decoding mechanism.
+
+    d_model=256, 4 layers, 8 heads, n_knows=16 anchors → ~3.7 M params.
+    """
+
+    def __init__(self, d_model: int = 256, n_heads: int = 8,
+                 n_layers: int = 4, n_knows: int = 16,
+                 dropout: float = 0.2,
+                 num_conf_classes: int = NUM_CONF_CLASSES):
+        super().__init__()
+        self.embed = StepEmbedder(d_model, num_conf_classes)
+
+        # Stable encoder — pre-norm transformer with causal masking.
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True, activation="gelu",
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, n_layers)
+
+        # Learnable "knowledge anchor" queries that the diagnostic
+        # decoder attends to (acts as a small set of concept prototypes).
+        self.know_queries = nn.Parameter(
+            torch.randn(n_knows, d_model) / (d_model ** 0.5)
+        )
+        self.know_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True,
+        )
+        self.know_norm = nn.LayerNorm(d_model)
+
+        # Diagnostic head — pooled knowledge state → per-concept logits.
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, PA.NUM_TAGS),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.embed(x)
+        T = h.size(1)
+        h = h + sinusoidal_pe(T, h.size(-1), x.device)
+        causal = nn.Transformer.generate_square_subsequent_mask(T).to(x.device)
+        h = self.encoder(h, mask=causal)        # (B, T, d_model)
+
+        # Cross-attend the encoded sequence with knowledge anchors.
+        B = h.size(0)
+        q = self.know_queries.unsqueeze(0).expand(B, -1, -1)
+        ks, _ = self.know_attn(q, h, h)         # (B, n_knows, d_model)
+        ks = self.know_norm(ks)
+        pooled = ks.mean(dim=1)                  # (B, d_model)
+        return self.head(pooled)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Training loop (mirrors run_baselines_param_matched.py)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -318,6 +394,8 @@ def build_model(name: str, seed: int) -> nn.Module:
         return AKT(d_model=256, n_heads=8, n_layers=4)
     if name == "SimpleKT":
         return SimpleKT(d_model=256, n_heads=8, n_layers=4)
+    if name == "DTransformer":
+        return DTransformer(d_model=256, n_heads=8, n_layers=4, n_knows=16)
     raise ValueError(f"unknown model: {name}")
 
 
@@ -427,7 +505,7 @@ def main() -> int:
     parser.add_argument("--min_interactions", type=int, default=20)
     parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS,
-                        choices=["SAINT", "AKT", "SimpleKT"])
+                        choices=["SAINT", "AKT", "SimpleKT", "DTransformer"])
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--patience", type=int, default=5)

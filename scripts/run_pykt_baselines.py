@@ -92,12 +92,21 @@ class PyKTSequenceDataset(Dataset):
     PAD = 0
     PAD_RESP = 2
 
-    def __init__(self, df: pd.DataFrame, seq_len: int = 100):
+    def __init__(self, df: pd.DataFrame, seq_len: int = 100,
+                 q2idx: dict | None = None):
+        """
+        q2idx: optional pre-built question→index mapping. When provided,
+        unknown question IDs are mapped to PAD (0). This is required for
+        consistent val/test indexing — every dataset MUST share the
+        train-set q2idx, otherwise the model is sized on one mapping but
+        gets indices from a different one and embedding lookup goes OOR.
+        """
         self.seq_len = seq_len
         self.q_seqs: list[np.ndarray] = []
         self.c_seqs: list[np.ndarray] = []
         self.r_seqs: list[np.ndarray] = []
         self.mask_seqs: list[np.ndarray] = []
+        self._fixed_q2idx = q2idx
 
         for uid, grp in df.groupby("user_id"):
             grp = grp.sort_values("timestamp")
@@ -138,16 +147,22 @@ class PyKTSequenceDataset(Dataset):
                 self.r_seqs.append(np.array(r_pad, dtype=np.int64))
                 self.mask_seqs.append(np.array(m_pad, dtype=np.int64))
 
-        # Build problem-id table from accumulated q strings
-        all_q = set()
-        for arr in self.q_seqs:
-            all_q.update(arr.tolist())
-        all_q.discard("__PAD__")
-        self.q2idx = {q: i + 1 for i, q in enumerate(sorted(all_q))}
-        self.q2idx["__PAD__"] = 0
+        # Build problem-id table — either from this df, or use passed
+        # q2idx (val/test reuse train's mapping; unknown q → PAD=0).
+        if self._fixed_q2idx is None:
+            all_q = set()
+            for arr in self.q_seqs:
+                all_q.update(arr.tolist())
+            all_q.discard("__PAD__")
+            self.q2idx = {q: i + 1 for i, q in enumerate(sorted(all_q))}
+            self.q2idx["__PAD__"] = 0
+        else:
+            self.q2idx = self._fixed_q2idx
         for i, arr in enumerate(self.q_seqs):
-            self.q_seqs[i] = np.array([self.q2idx[q] for q in arr.tolist()],
-                                       dtype=np.int64)
+            self.q_seqs[i] = np.array(
+                [self.q2idx.get(q, 0) for q in arr.tolist()],
+                dtype=np.int64,
+            )
 
     @property
     def n_questions(self) -> int:
@@ -207,20 +222,34 @@ def _forward_one(model_name: str, model, q, c, r):
     c = c.to(DEVICE)
     r = r.to(DEVICE)
     if model_name == "SAINT":
-        # SAINT uses (in_ex=q, in_cat=c, in_res=r); response shifted by start token.
-        # SAINT eats r WITHOUT the last position, predicts T positions for
-        # next-step correctness. We feed r[:, :-1] and compare with r[:, 1:].
-        in_ex = q[:, :-1]
-        in_cat = c[:, :-1]
+        # pykt SAINT contract:
+        #   in_ex (questions) length T, in_cat (concepts) length T,
+        #   in_res (responses) length T-1; the model itself prepends a
+        #   start-token to in_res, making it length T inside, which then
+        #   matches in_pos = pos_encode(in_ex.shape[1]) = length T.
+        # Output shape (B, T) — position t predicts the response at step t.
+        # Position 0 is conditioned only on the start token (no info), so
+        # we drop it and align preds[:, 1:] with target r[:, 1:].
+        in_ex = q
+        in_cat = c
         in_res = r[:, :-1]
-        preds = model(in_ex, in_cat, in_res)
-        target = r[:, 1:]
+        preds = model(in_ex, in_cat, in_res)        # (B, T)
+        preds = preds[:, 1:]                         # (B, T-1)
+        target = r[:, 1:]                            # (B, T-1)
         mask = (target != PyKTSequenceDataset.PAD_RESP)
         return preds, target, mask
     if model_name == "AKT":
         # AKT canonical: q_data = c (concepts), pid_data = q (problems),
         # target = response. Predicts correctness of NEXT step.
-        preds, c_reg = model(c, r, pid_data=q)
+        # CRITICAL: pykt AKT computes q + n_q*target inside base_emb; if
+        # target contains PAD_RESP=2, the index exceeds the qa-embedding
+        # table size (2*n_q+1) and triggers a CUDA OOR assert. Clamp PAD
+        # response to 0 before feeding; the mask still excludes those
+        # positions from the loss/eval.
+        r_safe = torch.where(
+            r == PyKTSequenceDataset.PAD_RESP, torch.zeros_like(r), r,
+        )
+        preds, c_reg = model(c, r_safe, pid_data=q)
         target = r
         mask = (target != PyKTSequenceDataset.PAD_RESP)
         return preds, target, mask, c_reg
@@ -231,13 +260,21 @@ def train_one(name: str, seed: int, train_df, val_df, test_df,
               epochs: int, batch_size: int, patience: int,
               seq_len: int, lr: float = 1e-3) -> dict:
     set_global_seed(seed)
+    # Build q2idx ONCE on train, share with val/test so question indices
+    # map consistently across splits — otherwise the model is sized on
+    # train n_q but val/test feed independently-numbered indices and
+    # embedding lookup goes out of range.
     train_ds = PyKTSequenceDataset(train_df, seq_len=seq_len)
-    val_ds   = PyKTSequenceDataset(val_df,   seq_len=seq_len)
-    test_ds  = PyKTSequenceDataset(test_df,  seq_len=seq_len)
+    val_ds   = PyKTSequenceDataset(val_df,   seq_len=seq_len,
+                                    q2idx=train_ds.q2idx)
+    test_ds  = PyKTSequenceDataset(test_df,  seq_len=seq_len,
+                                    q2idx=train_ds.q2idx)
     if not len(train_ds) or not len(val_ds):
         return {"error": "empty dataset"}
 
-    n_q = max(train_ds.n_questions, val_ds.n_questions, test_ds.n_questions)
+    # Use train's universe for sizing — val/test share train's q2idx so
+    # all indices fit in train's range.
+    n_q = train_ds.n_questions
     n_c = max(train_ds.n_concepts,  val_ds.n_concepts,  test_ds.n_concepts)
     logger.info("%-6s seed=%d  n_q=%d  n_c=%d  train_seqs=%d",
                 name, seed, n_q, n_c, len(train_ds))
@@ -352,22 +389,79 @@ def main() -> int:
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seq_len", type=int, default=100)
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="Skip (model, seed) pairs whose JSON already exists in any "
+             "prior pykt_baselines_* dir or the current out_root.",
+    )
+    parser.add_argument(
+        "--reuse-dir", default=None,
+        help="Reuse this existing pykt_baselines_<ts> directory.",
+    )
     args = parser.parse_args()
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_root = ROOT / f"results/xes3g5m/pykt_baselines_{ts}"
-    out_root.mkdir(parents=True, exist_ok=True)
+    if args.reuse_dir:
+        out_root = ROOT / f"results/xes3g5m/{args.reuse_dir}"
+        out_root.mkdir(parents=True, exist_ok=True)
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_root = ROOT / f"results/xes3g5m/pykt_baselines_{ts}"
+        out_root.mkdir(parents=True, exist_ok=True)
     logger.info("=== PYKT CANONICAL BASELINES — out=%s ===", out_root)
     logger.info("models=%s  seeds=%s", args.models, args.seeds)
 
+    # stable pointer
+    (ROOT / "results/xes3g5m/pykt_baselines_latest.json").write_text(
+        json.dumps({"latest_dir": out_root.name}), encoding="utf-8")
+
+    # skip-existing: build done-pairs set from existing JSONs (no error)
+    done_pairs: set[tuple[str, int]] = set()
+    if args.skip_existing:
+        candidates = list((ROOT / "results/xes3g5m").glob("pykt_baselines_*"))
+        for d in candidates + [out_root]:
+            if not d.is_dir():
+                continue
+            for jf in d.glob("*_seed*.json"):
+                try:
+                    payload = json.loads(jf.read_text())
+                    if "error" not in payload:
+                        m = payload.get("model")
+                        s = payload.get("seed")
+                        if m is not None and s is not None:
+                            done_pairs.add((m, int(s)))
+                except Exception:
+                    pass
+        logger.info("skip-existing: %d pairs already complete",
+                    len(done_pairs))
+
     all_rows = []
     for seed in args.seeds:
+        need_seed = any((name, seed) not in done_pairs for name in args.models)
+        if not need_seed and args.skip_existing:
+            logger.info("seed=%d: all models complete, skipping data load", seed)
+            continue
         train_df, val_df, test_df = load_xes3g5m(
             n_students=args.n_students,
             min_interactions=args.min_interactions, seed=seed,
         )
         seed_out = {}
         for name in args.models:
+            if (name, seed) in done_pairs:
+                logger.info("━━━ %s seed=%d  SKIPPED (existing JSON) ━━━",
+                            name, seed)
+                # load existing payload into seed_out for legacy combined file
+                safe = f"{name}_seed{seed}.json"
+                jf = out_root / safe
+                if not jf.exists():
+                    # find in another dir
+                    for d in (ROOT / "results/xes3g5m").glob("pykt_baselines_*"):
+                        candidate = d / safe
+                        if candidate.exists():
+                            jf = candidate
+                            break
+                if jf.exists():
+                    seed_out[name] = json.loads(jf.read_text())
+                continue
             logger.info("━━━ %s seed=%d ━━━", name, seed)
             t0 = time.time()
             try:
@@ -382,7 +476,18 @@ def main() -> int:
                     all_rows.append(m)
             except Exception as e:
                 logger.exception("%s seed=%d failed: %s", name, seed, e)
-                seed_out[name] = {"error": str(e)}
+                seed_out[name] = {"error": str(e),
+                                   "runtime_s": round(time.time() - t0, 1)}
+
+            # ── IMMEDIATE per-(model, seed) save to survive future crash ──
+            single_file = out_root / f"{name}_seed{seed}.json"
+            single_file.write_text(
+                json.dumps(seed_out[name], indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.info("→ saved %s", single_file.name)
+
+        # legacy combined per-seed file (back-compat with first-pass tooling)
         (out_root / f"baselines_s{seed}.json").write_text(
             json.dumps(seed_out, indent=2, default=str), encoding="utf-8"
         )
