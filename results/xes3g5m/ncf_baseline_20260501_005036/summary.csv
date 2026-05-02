@@ -1,0 +1,2 @@
+model,n_seeds,test_auc_macro_mean,test_auc_macro_std,ndcg@10_mean,ndcg@10_std,precision@10_mean,precision@10_std,recall@10_mean,recall@10_std,mrr_mean,mrr_std,tag_coverage_mean,tag_coverage_std
+NCF,5,0.7889,0.0027,0.1502,0.0031,0.0712,0.0018,0.2191,0.0035,0.1779,0.0044,0.321,0.0112

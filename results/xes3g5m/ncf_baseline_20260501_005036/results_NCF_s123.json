@@ -1,0 +1,22 @@
+{
+  "test_auc_macro": 0.7919,
+  "test_auc_weighted": 0.7608,
+  "test_f1_micro": 0.0774,
+  "ndcg@10": 0.1462,
+  "precision@10": 0.0691,
+  "recall@10": 0.2161,
+  "mrr": 0.1706,
+  "tag_coverage": 0.3294,
+  "question_coverage": 0.1921,
+  "diversity": 1.0,
+  "novelty": -0.8848,
+  "learning_gain": 0.028,
+  "learning_gain_std": 0.0914,
+  "learning_gain_trimmed": 0.0282,
+  "n_eval_tags": 504,
+  "n_eval_users": 17817,
+  "model": "NCF",
+  "seed": 123,
+  "n_params": 143041,
+  "val_auc": 0.7915
+}

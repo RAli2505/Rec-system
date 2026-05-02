@@ -1,0 +1,26 @@
+{
+  "SASRec": {
+    "test_auc_macro": 0.9601,
+    "test_auc_weighted": 0.9551,
+    "test_f1_micro": 0.012,
+    "ndcg@10": 0.5346,
+    "precision@10": 0.2221,
+    "recall@10": 0.6713,
+    "mrr": 0.5918,
+    "tag_coverage": 0.626,
+    "question_coverage": 0.3653,
+    "diversity": 1.0,
+    "novelty": -0.1578,
+    "learning_gain": 0.0259,
+    "learning_gain_std": 0.093,
+    "learning_gain_trimmed": 0.0248,
+    "n_eval_tags": 500,
+    "n_eval_users": 18279,
+    "model": "SASRec",
+    "seed": 456,
+    "n_params": 601129,
+    "val_auc": 0.9457,
+    "best_epoch": 10,
+    "runtime_s": 4481.6
+  }
+}

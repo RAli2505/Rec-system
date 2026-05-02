@@ -383,6 +383,64 @@ class DTransformer(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 5. SASRec — Self-Attentive Sequential Recommendation
+#     (Kang & McAuley, ICDM 2018 — canonical sequential recsys baseline)
+# ─────────────────────────────────────────────────────────────────────
+
+class SASRec(nn.Module):
+    """SASRec: causal self-attention over the user's interaction
+    sequence, with the last hidden state read out as the "current
+    user state". The original paper predicts next-item rank; we
+    adapt the head to predict per-tag failure probability so the
+    metric harness (NDCG@10/MRR/P@10/Tag Cov) matches the other
+    A-style baselines on identical 14-dim per-step input. Closes
+    reviewer item C1 (canonical recsys baseline).
+
+    Differences from SimpleKT in this codebase:
+      - learned positional embedding (not sinusoidal)
+      - last-timestep readout (not mean pool) — the canonical SASRec
+        formulation: h_T summarises user state at time T
+      - explicit multi-label output head, not tied to tag embedding
+
+    d_model=128, 2 layers, 2 heads — closer to the smaller default
+    of the original paper. ~0.6 M params.
+    """
+
+    def __init__(self, d_model: int = 128, n_heads: int = 2,
+                 n_layers: int = 2, max_len: int = 200,
+                 dropout: float = 0.2,
+                 num_conf_classes: int = NUM_CONF_CLASSES):
+        super().__init__()
+        self.embed = StepEmbedder(d_model, num_conf_classes)
+        self.pos_emb = nn.Embedding(max_len, d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True, activation="gelu",
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, n_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, PA.NUM_TAGS),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.embed(x)                                  # (B, T, D)
+        T = h.size(1)
+        positions = torch.arange(T, device=x.device).clamp_max(
+            self.pos_emb.num_embeddings - 1
+        )
+        h = h + self.pos_emb(positions).unsqueeze(0)
+        causal = nn.Transformer.generate_square_subsequent_mask(T).to(x.device)
+        h = self.encoder(h, mask=causal)                   # (B, T, D)
+        h = self.norm(h[:, -1])                             # last timestep
+        return self.head(h)                                  # (B, NUM_TAGS)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Training loop (mirrors run_baselines_param_matched.py)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -396,6 +454,8 @@ def build_model(name: str, seed: int) -> nn.Module:
         return SimpleKT(d_model=256, n_heads=8, n_layers=4)
     if name == "DTransformer":
         return DTransformer(d_model=256, n_heads=8, n_layers=4, n_knows=16)
+    if name == "SASRec":
+        return SASRec(d_model=128, n_heads=2, n_layers=2)
     raise ValueError(f"unknown model: {name}")
 
 
@@ -505,7 +565,7 @@ def main() -> int:
     parser.add_argument("--min_interactions", type=int, default=20)
     parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS,
-                        choices=["SAINT", "AKT", "SimpleKT", "DTransformer"])
+                        choices=["SAINT", "AKT", "SimpleKT", "DTransformer", "SASRec"])
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--patience", type=int, default=5)
