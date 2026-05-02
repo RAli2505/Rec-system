@@ -42,17 +42,75 @@ def parse(v):
     return float(s)
 
 
-# Use whichever methods are present in the CSV (extra baselines may have
-# been added since first paper draft). Keep them in a deliberate order.
-ALL_METHODS = ["Random", "Popularity", "BPR-MF", "CF-only", "Content-only",
-               "DKT (LSTM)", "GRU", "MARS (ours)"]
-methods = [m for m in ALL_METHODS if m in main.columns]
+# Methods compared in Fig. 3: only KT-style sequence models. The
+# trivial baselines (Random / Popularity / CF-only / Content-only)
+# were removed at revision time — they have AUC=0.5 by construction
+# on the per-concept failure task and contributed only visual noise.
+# BPR-MF is also a non-sequential baseline; we keep it only if its
+# column is present in the CSV.
+ALL_METHODS = ["DKT (LSTM)", "GRU", "NCF",
+               "SAINT", "AKT", "SimpleKT", "DTransformer", "SASRec",
+               "MARS (ours)"]
+
 # R@10 dropped: MARS evaluates on a filtered candidate pool, so its recall
 # is not directly comparable with full-tag-pool baselines.
 metrics = ["AUC-ROC", "NDCG@10", "Precision@10", "MRR", "Coverage"]
 
-M = np.array([[parse(main.loc[main["Metric"] == m, meth].values[0])
-               for meth in methods]
+
+def _load_attention_kt() -> dict:
+    """Aggregate the four hand-coded attention-KT baselines (5 seeds each)
+    into a {model_name: {metric: mean_value}} dict aligned with the
+    main_results.csv column convention."""
+    import json
+    from glob import glob
+    from collections import defaultdict
+    runs = defaultdict(list)
+    for jf in glob("results/xes3g5m/attention_kt_baselines_*/baselines_s*.json"):
+        try:
+            d = json.load(open(jf))
+        except Exception:
+            continue
+        for name, m in d.items():
+            if isinstance(m, dict) and "error" not in m:
+                runs[name].append(m)
+    # NCF baseline (separate output dir, one model per JSON)
+    for jf in glob("results/xes3g5m/ncf_baseline_*/results_NCF_s*.json"):
+        try:
+            m = json.load(open(jf))
+        except Exception:
+            continue
+        if isinstance(m, dict) and "error" not in m:
+            runs[m.get("model", "NCF")].append(m)
+    key_map = {
+        "AUC-ROC":      "test_auc_macro",
+        "NDCG@10":      "ndcg@10",
+        "Precision@10": "precision@10",
+        "MRR":          "mrr",
+        "Coverage":     "tag_coverage",
+    }
+    out = {}
+    for name, rs in runs.items():
+        row = {}
+        for label, key in key_map.items():
+            vals = [r.get(key) for r in rs if r.get(key) is not None]
+            if vals:
+                row[label] = float(np.mean(vals))
+        out[name] = row
+    return out
+
+
+_attn = _load_attention_kt()
+methods = [m for m in ALL_METHODS
+           if m in main.columns or m in _attn]
+
+
+def _value_for(metric: str, method: str) -> float:
+    if method in main.columns:
+        return parse(main.loc[main["Metric"] == metric, method].values[0])
+    return _attn[method].get(metric, np.nan)
+
+
+M = np.array([[_value_for(m, meth) for meth in methods]
               for m in metrics])  # shape (n_metrics, n_methods)
 
 
@@ -61,28 +119,34 @@ M = np.array([[parse(main.loc[main["Metric"] == m, meth].values[0])
 # ─────────────────────────────────────────────────────────────────────
 
 def fig_methods_heatmap():
-    # Per-row min-max normalization for fair colour comparison.
-    # Coverage > 1 (Random=1.058) is clipped to 1.0 since values above 1
-    # reflect a degenerate "recommend everything" pattern, not real coverage.
-    M_norm = M.copy()
-    M_norm[metrics.index("Coverage")] = np.clip(
-        M_norm[metrics.index("Coverage")], 0, 1.0
-    )
-    row_min = M_norm.min(axis=1, keepdims=True)
-    row_max = M_norm.max(axis=1, keepdims=True)
-    M_scaled = (M_norm - row_min) / (row_max - row_min + 1e-12)
-
+    # Absolute [0, 1] colour scale — preserves true magnitudes (AUC ≈ 0.95
+    # for everyone => uniformly dark; ranking metrics ≈ 0.2–0.9 => visible
+    # spread). Per-row normalisation was visually misleading: it inflated
+    # tiny AUC deltas (~0.01) to the full colour range while compressing
+    # the genuinely large NDCG/MRR gaps.
     fig, ax = plt.subplots(figsize=(DOUBLE_COL[0], 3.6))
 
-    im = ax.imshow(M_scaled, cmap="YlGnBu", aspect="auto", vmin=0, vmax=1)
+    im = ax.imshow(np.where(np.isnan(M), 0.0, M),
+                    cmap="viridis", aspect="auto", vmin=0.0, vmax=1.0)
 
-    # cell text: raw value
+    # Identify per-row winner so we can bold it.
+    row_argmax = np.array([
+        int(np.nanargmax(M[i])) if not np.all(np.isnan(M[i])) else -1
+        for i in range(M.shape[0])
+    ])
+
     for i in range(M.shape[0]):
         for j in range(M.shape[1]):
             val = M[i, j]
-            txt_color = "white" if M_scaled[i, j] > 0.55 else "#222"
+            if np.isnan(val):
+                ax.text(j, i, "—", ha="center", va="center",
+                        fontsize=9, color="#888")
+                continue
+            # viridis: dark at low values → white text below ~0.55
+            txt_color = "white" if val < 0.55 else "#101010"
+            weight = "bold" if j == row_argmax[i] else "normal"
             ax.text(j, i, f"{val:.3f}", ha="center", va="center",
-                    fontsize=9, color=txt_color)
+                    fontsize=9, color=txt_color, fontweight=weight)
 
     ax.set_xticks(range(len(methods)))
     ax.set_xticklabels(methods, rotation=20, ha="right")
@@ -91,17 +155,24 @@ def fig_methods_heatmap():
     ax.tick_params(axis="both", which="both", length=0)
     ax.grid(False)
 
+    # Subtle column separators
+    for j in range(1, len(methods)):
+        ax.axvline(j - 0.5, color="white", linewidth=0.6, alpha=0.35)
+    for i in range(1, len(metrics)):
+        ax.axhline(i - 0.5, color="white", linewidth=0.6, alpha=0.35)
+
     # Highlight MARS column
     mars_idx = methods.index("MARS (ours)")
     ax.add_patch(plt.Rectangle((mars_idx - 0.5, -0.5), 1, len(metrics),
-                                fill=False, edgecolor="#D55E00", linewidth=1.8))
+                                fill=False, edgecolor="#D55E00", linewidth=2.0))
 
     cbar = plt.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
-    cbar.set_label("Per-metric normalised score", fontsize=8)
+    cbar.set_label("Score (0–1, absolute scale)", fontsize=8)
     cbar.ax.tick_params(labelsize=8)
 
-    ax.set_title("MARS vs. baselines on XES3G5M (per-row normalisation)",
-                 pad=10)
+    ax.set_title("MARS vs. KT baselines on XES3G5M  "
+                 "(absolute scores; per-row winner in bold)",
+                 pad=10, fontsize=11)
 
     fig.tight_layout()
     save_figure(fig, "fig_methods_heatmap", results_dir=OUT_DIR)
